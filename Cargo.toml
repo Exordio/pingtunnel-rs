@@ -1,0 +1,33 @@
+[package]
+name = "pingtunnel"
+version = "1.0.0"
+edition = "2021"
+description = "Туннелирование TCP/UDP/SOCKS5 трафика поверх ICMP (порт esrrhs/pingtunnel на Rust)"
+license = "MIT"
+
+[[bin]]
+name = "pingtunnel"
+path = "src/main.rs"
+
+[dependencies]
+prost = "0.13"
+socket2 = { version = "0.5", features = ["all"] }
+clap = { version = "4", features = ["derive"] }
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+rand = "0.8"
+flate2 = "1"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+
+[build-dependencies]
+prost-build = "0.13"
+
+[profile.release]
+opt-level = 3
+lto = true
