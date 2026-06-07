@@ -187,11 +187,9 @@ async fn run_client(args: Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
     if args.sock5 != 0 {
         tcp = 1;
     }
-    if tcp == 0 {
-        anyhow::bail!("в этой async-сборке поддержан только TCP/SOCKS5: задайте --tcp 1 или --sock5 1");
-    }
+    // tcp==0 без sock5 = режим чистого UDP-проброса (нужен -t).
     if args.sock5 == 0 && args.target.is_empty() {
-        anyhow::bail!("client requires -t (target) unless -sock5 is set");
+        anyhow::bail!("client requires -t (target) for UDP/TCP forward, or -sock5 1");
     }
     if args.tcp_mw * 10 > proto::FRAME_MAX_ID {
         anyhow::bail!("tcp win too big, max = {}", proto::FRAME_MAX_ID / 10);

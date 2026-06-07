@@ -1,22 +1,23 @@
 //! Async-сервер на tokio: принимает ICMP пачками (recvmmsg), демультиплексирует
 //! по conn-id в задачи соединений; каждая задача дозванивается к цели и качает
 //! трафик по событиям. Исходящее — через единый write-таск (sendmmsg).
-//! В этой async-итерации поддержан TCP/SOCKS5-CONNECT (UDP — следующим шагом).
+//! Поддержаны TCP (через FrameMgr) и UDP (прямой проброс датаграмм).
 
 use crate::crypto::Crypto;
 use crate::forward::{self, ForwardConfig};
 use crate::framemgr::{marshal_frame, FrameMgr};
 use crate::icmp::{self, encode_packet, IcmpIo, OutPkt, RecvBatch};
 use crate::proto::*;
-use crate::util::Counters;
+use crate::util::{now_ns, Counters};
 use anyhow::Result;
 use prost::Message as _;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -51,6 +52,17 @@ enum Incoming {
     Kick,
 }
 
+/// Серверное UDP-соединение (без FrameMgr): канал данных к задаче + куда слать ответы.
+struct ServerUdpConn {
+    tx: mpsc::Sender<Vec<u8>>, // данные client→target (задача шлёт через send().await)
+    target: String,            // строка target (в ответном MyMsg.target)
+    rproto: i32,               // sproto для ответа
+    echo_id: AtomicU16,
+    echo_seq: AtomicU16,
+    src: AtomicU32,            // ip клиента (биты), куда слать ICMP-ответ
+    last: AtomicI64,
+}
+
 pub struct Server {
     cfg: ServerConfig,
     io: Arc<IcmpIo>,
@@ -59,6 +71,7 @@ pub struct Server {
     datagram: bool,
     forward: Option<ForwardConfig>,
     conns: Mutex<HashMap<String, mpsc::Sender<Incoming>>>,
+    udp_conns: Mutex<HashMap<String, Arc<ServerUdpConn>>>,
     conn_error: Mutex<HashMap<String, Instant>>,
     counters: Counters,
 }
@@ -83,6 +96,7 @@ impl Server {
             datagram,
             forward,
             conns: Mutex::new(HashMap::new()),
+            udp_conns: Mutex::new(HashMap::new()),
             conn_error: Mutex::new(HashMap::new()),
             counters: Counters::default(),
         }))
@@ -146,10 +160,24 @@ impl Server {
                                     if let Some(h) = h {
                                         let _ = h.try_send(Incoming::Kick);
                                     }
+                                    self.udp_conns.lock().unwrap().remove(&my.id);
                                 }
                                 _ => {
                                     if my.tcpmode == 0 {
-                                        continue; // UDP в async-итерации не поддержан
+                                        // UDP: пишем данные в сокет к цели напрямую.
+                                        let uc = self.udp_conns.lock().unwrap().get(&my.id).cloned();
+                                        match uc {
+                                            Some(uc) => {
+                                                uc.echo_id.store(eid, Ordering::Relaxed);
+                                                uc.echo_seq.store(eseq, Ordering::Relaxed);
+                                                uc.src.store(u32::from(src), Ordering::Relaxed);
+                                                uc.last.store(now_ns(), Ordering::Relaxed);
+                                                self.counters.add_recv(my.data.len());
+                                                let _ = uc.tx.try_send(my.data);
+                                            }
+                                            None => self.create_udp_conn(my, eid, eseq, src),
+                                        }
+                                        continue;
                                     }
                                     let exists = self.conns.lock().unwrap().contains_key(&my.id);
                                     if exists {
@@ -220,6 +248,119 @@ impl Server {
         self.conns.lock().unwrap().insert(id.clone(), tx);
         let me = self.clone();
         tokio::spawn(me.server_conn(id, addr, params, echo_id, echo_seq, src, rx));
+    }
+
+    /// Создаёт серверное UDP-соединение к цели (без FrameMgr).
+    fn create_udp_conn(self: &Arc<Self>, my: MyMsg, echo_id: u16, echo_seq: u16, src: Ipv4Addr) {
+        let id = my.id.clone();
+        let addr = my.target.clone();
+        if self.cfg.maxconn > 0 && self.udp_conns.lock().unwrap().len() >= self.cfg.maxconn as usize {
+            self.remote_error(echo_id, echo_seq, &id, my.rproto, src);
+            return;
+        }
+        if self.is_conn_error(&addr) {
+            self.remote_error(echo_id, echo_seq, &id, my.rproto, src);
+            return;
+        }
+        let (dtx, drx) = mpsc::channel::<Vec<u8>>(256);
+        let uc = Arc::new(ServerUdpConn {
+            tx: dtx,
+            target: addr.clone(),
+            rproto: my.rproto,
+            echo_id: AtomicU16::new(echo_id),
+            echo_seq: AtomicU16::new(echo_seq),
+            src: AtomicU32::new(u32::from(src)),
+            last: AtomicI64::new(now_ns()),
+        });
+        self.udp_conns.lock().unwrap().insert(id.clone(), uc.clone());
+        self.counters.add_recv(my.data.len());
+        let _ = uc.tx.try_send(my.data); // первый датаграм
+        let to = my.timeout.max(1);
+        let me = self.clone();
+        tokio::spawn(me.server_udp_task(id, uc, addr, to, drx));
+    }
+
+    /// Задача UDP-соединения: дозванивается к цели, форвардит в обе стороны.
+    async fn server_udp_task(
+        self: Arc<Self>,
+        id: String,
+        uc: Arc<ServerUdpConn>,
+        addr: String,
+        timeout_secs: i32,
+        mut drx: mpsc::Receiver<Vec<u8>>,
+    ) {
+        // bind+connect асинхронно (без EWOULDBLOCK на первом send).
+        let sock = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                log::debug!("udp bind failed: {e}");
+                self.remote_error_for(&uc, &id);
+                self.udp_conns.lock().unwrap().remove(&id);
+                return;
+            }
+        };
+        if let Err(e) = sock.connect(&addr).await {
+            log::debug!("udp connect {addr} failed: {e}");
+            self.remote_error_for(&uc, &id);
+            self.add_conn_error(&addr);
+            self.udp_conns.lock().unwrap().remove(&id);
+            return;
+        }
+
+        let timeout_ns = timeout_secs as i64 * 1_000_000_000;
+        let mut idle = tokio::time::interval(Duration::from_secs(timeout_secs.max(1) as u64));
+        idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut buf = vec![0u8; 65535];
+        loop {
+            tokio::select! {
+                data = drx.recv() => {
+                    match data {
+                        Some(d) => { let _ = sock.send(&d).await; uc.last.store(now_ns(), Ordering::Relaxed); }
+                        None => break,
+                    }
+                }
+                r = sock.recv(&mut buf) => {
+                    match r {
+                        Ok(n) if n > 0 => {
+                            uc.last.store(now_ns(), Ordering::Relaxed);
+                            let my = MyMsg {
+                                id: id.clone(),
+                                r#type: MSG_DATA,
+                                target: uc.target.clone(),
+                                data: buf[..n].to_vec(),
+                                rproto: -1,
+                                key: self.cfg.key,
+                                ..Default::default()
+                            };
+                            let bytes = encode_packet(my, uc.rproto as u8,
+                                uc.echo_id.load(Ordering::Relaxed),
+                                uc.echo_seq.load(Ordering::Relaxed), self.crypto.as_ref());
+                            self.counters.add_send(n);
+                            let dst = Ipv4Addr::from(uc.src.load(Ordering::Relaxed));
+                            let _ = self.tx.send((dst, bytes)).await;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                _ = idle.tick() => {
+                    if now_ns() - uc.last.load(Ordering::Relaxed) > timeout_ns { break; }
+                }
+            }
+        }
+        self.udp_conns.lock().unwrap().remove(&id);
+        log::debug!("close udp conn {id}");
+    }
+
+    fn remote_error_for(&self, uc: &ServerUdpConn, id: &str) {
+        let dst = Ipv4Addr::from(uc.src.load(Ordering::Relaxed));
+        self.remote_error(
+            uc.echo_id.load(Ordering::Relaxed),
+            uc.echo_seq.load(Ordering::Relaxed),
+            id,
+            uc.rproto,
+            dst,
+        );
     }
 
     async fn server_conn(
@@ -391,7 +532,7 @@ impl Server {
                 .unwrap()
                 .retain(|_, t| t.elapsed() <= Duration::from_secs(5));
             let (sp, ss, rp, rs) = self.counters.take();
-            let n = self.conns.lock().unwrap().len();
+            let n = self.conns.lock().unwrap().len() + self.udp_conns.lock().unwrap().len();
             log::info!("send {sp}Packet/s {ss}KB/s recv {rp}Packet/s {rs}KB/s {n}Connections");
         }
     }

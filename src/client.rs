@@ -12,12 +12,12 @@ use crate::util::{now_ns, resolve_ipv4, unique_id, Counters};
 use anyhow::Result;
 use prost::Message as _;
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 
 const SEND_PROTO: u8 = ICMP_ECHO_REQUEST; // 8
@@ -49,6 +49,16 @@ enum Incoming {
     Kick,
 }
 
+/// UDP-соединение (без FrameMgr — прямой проброс датаграмм).
+struct UdpConn {
+    src: SocketAddr,      // куда слать ответы локально
+    sock: Arc<UdpSocket>, // через какой сокет (listen для plain, relay для socks5)
+    socks5: bool,         // оборачивать ответ в socks5-датаграмму
+    target: String,       // целевой адрес (для socks5-датаграммы)
+    addr_key: String,     // ключ в udp_by_addr
+    last: AtomicI64,      // время последней активности
+}
+
 pub struct Client {
     cfg: ClientConfig,
     io: Arc<IcmpIo>,
@@ -59,6 +69,8 @@ pub struct Client {
     seq: AtomicU32,
     server_ip: Mutex<Ipv4Addr>,
     conns: Mutex<HashMap<String, mpsc::Sender<Incoming>>>,
+    udp_conns: Mutex<HashMap<String, Arc<UdpConn>>>,
+    udp_by_addr: Mutex<HashMap<String, String>>,
     counters: Counters,
 }
 
@@ -79,6 +91,8 @@ impl Client {
             seq: AtomicU32::new(0),
             server_ip: Mutex::new(server_ip),
             conns: Mutex::new(HashMap::new()),
+            udp_conns: Mutex::new(HashMap::new()),
+            udp_by_addr: Mutex::new(HashMap::new()),
             counters: Counters::default(),
         }))
     }
@@ -104,6 +118,13 @@ impl Client {
         );
 
         let listen = normalize_bind(&self.cfg.listen);
+
+        // Чистый UDP-проброс: слушаем локальный UDP и гоняем датаграммы.
+        if self.cfg.tcpmode == 0 && self.cfg.sock5 == 0 {
+            let sock = Arc::new(UdpSocket::bind(&listen).await?);
+            return self.accept_udp(sock).await;
+        }
+
         let listener = TcpListener::bind(&listen).await?;
         loop {
             let (sock, _peer) = match listener.accept().await {
@@ -161,7 +182,13 @@ impl Client {
                                 }
                                 _ => {
                                     self.counters.add_recv(my.data.len());
-                                    groups.entry(my.id).or_default().push(my.data);
+                                    // UDP-соединение? — отвечаем сразу, не группируя как фрейм.
+                                    let uc = self.udp_conns.lock().unwrap().get(&my.id).cloned();
+                                    if let Some(uc) = uc {
+                                        self.reply_udp(&uc, &my.target, &my.data);
+                                    } else {
+                                        groups.entry(my.id).or_default().push(my.data);
+                                    }
                                 }
                             }
                         }
@@ -230,6 +257,178 @@ impl Client {
         encode_packet(my, SEND_PROTO, self.id, self.next_seq(), self.crypto.as_ref())
     }
 
+    // ── UDP-проброс ───────────────────────────────────────────────────────
+
+    fn send_udp(&self, id: &str, target: &str, data: &[u8]) {
+        let my = MyMsg {
+            id: id.to_string(),
+            r#type: MSG_DATA,
+            target: target.to_string(),
+            data: data.to_vec(),
+            rproto: RECV_PROTO,
+            key: self.cfg.key,
+            tcpmode: 0,
+            timeout: self.cfg.timeout,
+            ..Default::default()
+        };
+        let bytes = encode_packet(my, SEND_PROTO, self.id, self.next_seq(), self.crypto.as_ref());
+        self.counters.add_send(data.len());
+        let _ = self.tx.try_send((self.server_ip(), bytes));
+    }
+
+    /// Пишет ответный UDP-датаграм локально (sync, неблокирующе).
+    fn reply_udp(&self, uc: &UdpConn, target_from_pkt: &str, data: &[u8]) {
+        if uc.socks5 {
+            let target = if !target_from_pkt.is_empty() {
+                target_from_pkt
+            } else {
+                &uc.target
+            };
+            if let Ok(dgram) = socks5::build_udp_datagram(target, data) {
+                let _ = uc.sock.try_send_to(&dgram, uc.src);
+            }
+        } else {
+            let _ = uc.sock.try_send_to(data, uc.src);
+        }
+        uc.last.store(now_ns(), Ordering::Relaxed);
+    }
+
+    /// Находит/создаёт UDP-соединение по ключу адреса. Возвращает id.
+    fn get_or_create_udp(
+        &self,
+        addr_key: String,
+        src: SocketAddr,
+        sock: Arc<UdpSocket>,
+        socks5: bool,
+        target: String,
+    ) -> String {
+        if let Some(id) = self.udp_by_addr.lock().unwrap().get(&addr_key) {
+            return id.clone();
+        }
+        let id = unique_id();
+        let uc = Arc::new(UdpConn {
+            src,
+            sock,
+            socks5,
+            target,
+            addr_key: addr_key.clone(),
+            last: AtomicI64::new(now_ns()),
+        });
+        self.udp_conns.lock().unwrap().insert(id.clone(), uc);
+        self.udp_by_addr.lock().unwrap().insert(addr_key, id.clone());
+        id
+    }
+
+    fn close_udp(&self, id: &str) {
+        if let Some(uc) = self.udp_conns.lock().unwrap().remove(id) {
+            self.udp_by_addr.lock().unwrap().remove(&uc.addr_key);
+        }
+    }
+
+    /// Чистый UDP-проброс: датаграммы с локального порта → сервер → target.
+    async fn accept_udp(self: Arc<Self>, sock: Arc<UdpSocket>) -> Result<()> {
+        log::info!("client udp forward listen");
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let (n, src) = match sock.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(e) => {
+                    log::debug!("udp recv error: {e}");
+                    continue;
+                }
+            };
+            let id = self.get_or_create_udp(
+                src.to_string(),
+                src,
+                sock.clone(),
+                false,
+                self.cfg.target.clone(),
+            );
+            if let Some(uc) = self.udp_conns.lock().unwrap().get(&id) {
+                uc.last.store(now_ns(), Ordering::Relaxed);
+            }
+            self.send_udp(&id, &self.cfg.target, &buf[..n]);
+        }
+    }
+
+    /// SOCKS5 UDP ASSOCIATE: поднимаем relay-сокет, держим управляющий TCP.
+    async fn accept_socks5_udp(self: Arc<Self>, mut control: tokio::net::TcpStream) {
+        let relay = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                log::debug!("socks5 udp relay bind: {e}");
+                let _ =
+                    socks5::write_reply_async(&mut control, socks5::REPLY_GENERAL_FAILURE, "0.0.0.0:0")
+                        .await;
+                return;
+            }
+        };
+        let mut relay_addr = relay.local_addr().unwrap();
+        if relay_addr.ip().is_unspecified() {
+            if let Ok(local) = control.local_addr() {
+                relay_addr = SocketAddr::new(local.ip(), relay_addr.port());
+            }
+        }
+        if socks5::write_reply_async(&mut control, socks5::REPLY_SUCCEEDED, &relay_addr.to_string())
+            .await
+            .is_err()
+        {
+            return;
+        }
+        log::debug!("socks5 udp associate relay {relay_addr}");
+
+        let me = self.clone();
+        let relay2 = relay.clone();
+        let recv = tokio::spawn(async move { me.recv_socks5_udp(relay2).await });
+
+        // Держим управляющий TCP открытым; разрыв = конец ассоциации.
+        let mut b = [0u8; 1];
+        loop {
+            match control.read(&mut b).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        recv.abort();
+        self.close_socks5_udp_flows(&relay);
+        log::debug!("socks5 udp associate closed {relay_addr}");
+    }
+
+    async fn recv_socks5_udp(self: Arc<Self>, relay: Arc<UdpSocket>) {
+        let relay_local = relay.local_addr().map(|a| a.to_string()).unwrap_or_default();
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let (n, src) = match relay.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let (target, payload) = match socks5::parse_udp_datagram(&buf[..n]) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let key = format!("{relay_local}|{src}|{target}");
+            let id = self.get_or_create_udp(key, src, relay.clone(), true, target.clone());
+            if let Some(uc) = self.udp_conns.lock().unwrap().get(&id) {
+                uc.last.store(now_ns(), Ordering::Relaxed);
+            }
+            self.send_udp(&id, &target, &payload);
+        }
+    }
+
+    fn close_socks5_udp_flows(&self, relay: &Arc<UdpSocket>) {
+        let ids: Vec<String> = self
+            .udp_conns
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, uc)| uc.socks5 && Arc::ptr_eq(&uc.sock, relay))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            self.close_udp(&id);
+        }
+    }
+
     // ── Локальные соединения ─────────────────────────────────────────────
 
     async fn handle_socks5(self: Arc<Self>, mut sock: tokio::net::TcpStream) {
@@ -258,6 +457,9 @@ impl Client {
                     return;
                 }
                 self.serve_conn(sock, req.address).await;
+            }
+            socks5::CMD_UDP_ASSOCIATE => {
+                self.accept_socks5_udp(sock).await;
             }
             other => {
                 log::debug!("unsupported socks command: {other}");
@@ -392,8 +594,22 @@ impl Client {
         loop {
             tick.tick().await;
             self.ping();
+            // Закрываем неактивные UDP-соединения.
+            let now = now_ns();
+            let timeout_ns = self.cfg.timeout.max(1) as i64 * 1_000_000_000;
+            let stale: Vec<String> = self
+                .udp_conns
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, uc)| now - uc.last.load(Ordering::Relaxed) > timeout_ns)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in stale {
+                self.close_udp(&id);
+            }
             let (sp, ss, rp, rs) = self.counters.take();
-            let n = self.conns.lock().unwrap().len();
+            let n = self.conns.lock().unwrap().len() + self.udp_conns.lock().unwrap().len();
             log::info!("send {sp}Packet/s {ss}KB/s recv {rp}Packet/s {rs}KB/s {n}Connections");
             if let Ok(ip) = resolve_ipv4(&self.cfg.server) {
                 let mut cur = self.server_ip.lock().unwrap();
