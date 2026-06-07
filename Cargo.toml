@@ -10,6 +10,9 @@ name = "pingtunnel"
 path = "src/main.rs"
 
 [dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros", "signal"] }
+libc = "0.2"
+num_cpus = "1"
 prost = "0.13"
 socket2 = { version = "0.5", features = ["all"] }
 clap = { version = "4", features = ["derive"] }

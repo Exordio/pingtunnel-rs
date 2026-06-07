@@ -5,6 +5,7 @@
 use anyhow::{anyhow, bail, Result};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const SOCKS5_VERSION: u8 = 0x05;
 
@@ -67,6 +68,120 @@ pub fn server_handshake<S: Read + Write>(
             bail!("socks5 auth failed");
         }
     }
+    Ok(())
+}
+
+// ── Async-версии (tokio) ─────────────────────────────────────────────────
+
+/// Async серверное рукопожатие SOCKS5 (no-auth / user-pass).
+pub async fn server_handshake_async<S: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut S,
+    username: &str,
+    password: &str,
+) -> Result<()> {
+    let mut head = [0u8; 2];
+    conn.read_exact(&mut head).await?;
+    if head[0] != SOCKS5_VERSION {
+        bail!("socks version not supported: {}", head[0]);
+    }
+    let nmethod = head[1] as usize;
+    let mut methods = vec![0u8; nmethod];
+    conn.read_exact(&mut methods).await?;
+
+    if username.is_empty() && password.is_empty() {
+        conn.write_all(&[SOCKS5_VERSION, 0x00]).await?;
+    } else {
+        conn.write_all(&[SOCKS5_VERSION, 0x02]).await?;
+        let mut header = [0u8; 2];
+        conn.read_exact(&mut header).await?;
+        if header[0] != AUTH_VERSION {
+            bail!("unsupported auth version: {}", header[0]);
+        }
+        let ulen = header[1] as usize;
+        let mut user = vec![0u8; ulen];
+        conn.read_exact(&mut user).await?;
+        let mut plen = [0u8; 1];
+        conn.read_exact(&mut plen).await?;
+        let mut pass = vec![0u8; plen[0] as usize];
+        conn.read_exact(&mut pass).await?;
+        let ok = user == username.as_bytes() && pass == password.as_bytes();
+        conn.write_all(&[AUTH_VERSION, if ok { 0x00 } else { 0x01 }])
+            .await?;
+        if !ok {
+            bail!("socks5 auth failed");
+        }
+    }
+    Ok(())
+}
+
+/// Async чтение запроса SOCKS5.
+pub async fn read_request_async<S: AsyncRead + Unpin>(conn: &mut S) -> Result<Socks5Request> {
+    let mut header = [0u8; 4];
+    conn.read_exact(&mut header).await?;
+    if header[0] != SOCKS5_VERSION {
+        bail!("unsupported socks version: {}", header[0]);
+    }
+    if header[2] != 0x00 {
+        bail!("invalid socks reserved byte: {}", header[2]);
+    }
+    let addr = read_address_async(conn, header[3]).await?;
+    Ok(Socks5Request {
+        command: header[1],
+        address: addr,
+    })
+}
+
+async fn read_address_async<S: AsyncRead + Unpin>(conn: &mut S, atyp: u8) -> Result<String> {
+    match atyp {
+        ATYP_IPV4 => {
+            let mut buf = [0u8; 6];
+            conn.read_exact(&mut buf).await?;
+            let ip = std::net::Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
+            let port = u16::from_be_bytes([buf[4], buf[5]]);
+            Ok(format!("{ip}:{port}"))
+        }
+        ATYP_IPV6 => {
+            let mut buf = [0u8; 18];
+            conn.read_exact(&mut buf).await?;
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&buf[..16]);
+            let ip = std::net::Ipv6Addr::from(o);
+            let port = u16::from_be_bytes([buf[16], buf[17]]);
+            Ok(format!("[{ip}]:{port}"))
+        }
+        ATYP_DOMAIN => {
+            let mut lb = [0u8; 1];
+            conn.read_exact(&mut lb).await?;
+            let dlen = lb[0] as usize;
+            if dlen == 0 {
+                bail!("invalid empty domain");
+            }
+            let mut buf = vec![0u8; dlen + 2];
+            conn.read_exact(&mut buf).await?;
+            let host = String::from_utf8_lossy(&buf[..dlen]).to_string();
+            let port = u16::from_be_bytes([buf[dlen], buf[dlen + 1]]);
+            Ok(format!("{host}:{port}"))
+        }
+        other => bail!("unsupported socks5 address type: {other}"),
+    }
+}
+
+/// Async запись ответа SOCKS5.
+pub async fn write_reply_async<S: AsyncWrite + Unpin>(
+    conn: &mut S,
+    rep: u8,
+    bind_addr: &str,
+) -> Result<()> {
+    let bind_addr = if bind_addr.is_empty() {
+        "0.0.0.0:0"
+    } else {
+        bind_addr
+    };
+    let encoded = encode_address(bind_addr)?;
+    let mut reply = Vec::with_capacity(3 + encoded.len());
+    reply.extend_from_slice(&[SOCKS5_VERSION, rep, 0x00]);
+    reply.extend_from_slice(&encoded);
+    conn.write_all(&reply).await?;
     Ok(())
 }
 
