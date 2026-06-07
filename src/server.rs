@@ -102,7 +102,7 @@ impl Server {
     // ── Приём ICMP (батч) + демультиплекс ────────────────────────────────
 
     async fn read_loop(self: Arc<Self>) {
-        let mut rb = RecvBatch::new(64);
+        let mut rb = RecvBatch::new(32);
         let mut groups: HashMap<String, (Vec<Vec<u8>>, u16, u16, Ipv4Addr)> = HashMap::new();
         loop {
             let mut guard = match self.io.fd.readable().await {

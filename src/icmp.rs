@@ -21,7 +21,9 @@ pub const ICMP_ECHO_REQUEST: u8 = 8;
 #[allow(dead_code)]
 pub const ICMP_ECHO_REPLY: u8 = 0;
 
-const BUFSZ: usize = 2048;
+// Должен вмещать самый большой ICMP-датаграм (jumbo-кадр + IP/ICMP-заголовки
+// после сборки IP-фрагментов ядром). 64 КБ покрывает любой допустимый размер.
+const BUFSZ: usize = 65535;
 
 /// Открывает ICMP-сокет (RAW, при отказе — непривилегированный datagram),
 /// делает его неблокирующим и тюнит буферы. Возвращает сокет и флаг datagram.

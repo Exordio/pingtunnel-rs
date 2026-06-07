@@ -53,10 +53,11 @@ struct Args {
     tcp_rst: i32,
     #[arg(long = "tcp_gz", default_value_t = 0)]
     tcp_gz: i32,
-    /// Крупные фреймы (~1400Б вместо 888): меньше пакетов/syscalls, но теряется
-    /// маскировка под обычный ping. Ставится независимо на клиенте и сервере.
-    #[arg(long = "jumbo", default_value_t = false)]
-    jumbo: bool,
+    /// Размер кадра в байтах (0 = по умолчанию 888, маскировка под ping).
+    /// Крупнее = меньше пакетов/syscalls/CPU, но теряется маскировка и идёт
+    /// IP-фрагментация выше MTU. Ставится независимо на клиенте и сервере, напр. 8000.
+    #[arg(long = "jumbo", default_value_t = 0)]
+    jumbo: usize,
     #[arg(long = "loglevel", default_value = "info")]
     loglevel: String,
     #[arg(long = "noprint", default_value_t = 0)]
@@ -154,9 +155,9 @@ fn main() {
     }
 }
 
-fn frame_size(jumbo: bool) -> usize {
-    if jumbo {
-        1400
+fn frame_size(jumbo: usize) -> usize {
+    if jumbo > 0 {
+        jumbo.clamp(256, 60000)
     } else {
         proto::FRAME_MAX_SIZE
     }

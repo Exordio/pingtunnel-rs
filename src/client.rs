@@ -127,7 +127,7 @@ impl Client {
     // ── Приём ICMP (батч) ────────────────────────────────────────────────
 
     async fn read_loop(self: Arc<Self>) {
-        let mut rb = RecvBatch::new(64);
+        let mut rb = RecvBatch::new(32);
         let mut groups: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         loop {
             let mut guard = match self.io.fd.readable().await {
