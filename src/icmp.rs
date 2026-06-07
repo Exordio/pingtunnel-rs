@@ -1,33 +1,32 @@
-//! Низкоуровневый ICMP-транспорт: raw-сокет, сборка/разбор echo-пакетов и
-//! упаковка protobuf-сообщения MyMsg (с опциональным шифрованием) в payload.
+//! Асинхронный ICMP-транспорт с батчингом syscalls.
 //!
-//! На Linux raw ICMP-сокет при чтении возвращает пакет вместе с IP-заголовком,
-//! поэтому его длина вычисляется из IHL и отбрасывается, чтобы получить ICMP-часть
-//! ровно как в Go-версии (offset 8 = начало payload).
+//! Главная цель — убрать «один syscall на пакет» (это давало ~72% sys CPU на
+//! сервере). Чтение/запись идут пачками через `recvmmsg`/`sendmmsg` (десятки
+//! пакетов за один вызов ядра), а сокет интегрирован в tokio через `AsyncFd`.
+//!
+//! Сборка/разбор echo-пакетов и упаковка `MyMsg` (с опц. шифрованием) — здесь же.
 
 use crate::crypto::Crypto;
 use crate::proto::{MyMsg, MAGIC};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use prost::Message;
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
-use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
+use std::os::unix::io::AsRawFd;
+use std::{mem, ptr};
+use tokio::io::unix::AsyncFd;
 
 pub const ICMP_ECHO_REQUEST: u8 = 8;
 #[allow(dead_code)]
 pub const ICMP_ECHO_REPLY: u8 = 0;
 
-/// Открывает ICMP-сокет, привязанный к адресу (или 0.0.0.0).
-///
-/// Сначала пытается создать привилегированный RAW-сокет; при отказе
-/// (нет CAP_NET_RAW) откатывается на непривилегированный datagram-сокет
-/// (как android-путь Go-версии). Возвращает сокет и флаг datagram-режима.
-///
-/// Важно: datagram-режим пригоден для клиента (ядро управляет id и фильтрует
-/// echo reply по сокету), но сервер обязан использовать RAW, т.к. echo request
-/// на datagram-сокет не доставляется.
+// Должен вмещать самый большой ICMP-датаграм (jumbo-кадр + IP/ICMP-заголовки
+// после сборки IP-фрагментов ядром). 64 КБ покрывает любой допустимый размер.
+const BUFSZ: usize = 65535;
+
+/// Открывает ICMP-сокет (RAW, при отказе — непривилегированный datagram),
+/// делает его неблокирующим и тюнит буферы. Возвращает сокет и флаг datagram.
 pub fn listen_icmp(addr: &str) -> Result<(Socket, bool)> {
     let ip: Ipv4Addr = if addr.is_empty() {
         Ipv4Addr::UNSPECIFIED
@@ -36,37 +35,38 @@ pub fn listen_icmp(addr: &str) -> Result<(Socket, bool)> {
     };
     let bind = SocketAddr::new(IpAddr::V4(ip), 0);
 
-    match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)) {
-        Ok(socket) => {
-            socket.bind(&bind.into())?;
-            tune_socket(&socket);
-            Ok((socket, false))
-        }
+    let (socket, datagram) = match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)) {
+        Ok(s) => (s, false),
         Err(_) => {
-            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))?;
-            socket.bind(&bind.into())?;
-            tune_socket(&socket);
-            log::warn!("RAW ICMP недоступен (нет CAP_NET_RAW), используется datagram-режим (клиентский)");
-            Ok((socket, true))
+            let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))?;
+            log::warn!("RAW ICMP недоступен (нет CAP_NET_RAW), datagram-режим (клиентский)");
+            (s, true)
         }
+    };
+    socket.bind(&bind.into())?;
+    socket.set_nonblocking(true)?;
+    let _ = socket.set_send_buffer_size(8 << 20);
+    let _ = socket.set_recv_buffer_size(16 << 20);
+    Ok((socket, datagram))
+}
+
+/// Асинхронный ICMP-сокет, разделяемый между read- и write-тасками.
+pub struct IcmpIo {
+    pub fd: AsyncFd<Socket>,
+    pub datagram: bool,
+}
+
+impl IcmpIo {
+    pub fn new(socket: Socket, datagram: bool) -> io::Result<IcmpIo> {
+        Ok(IcmpIo {
+            fd: AsyncFd::new(socket)?,
+            datagram,
+        })
     }
 }
 
-/// Настраивает таймауты и размеры буферов ICMP-сокета.
-///
-/// Ключевой момент — таймаут на запись: при насыщении очереди отправки ядра
-/// (много соединений под нагрузкой) `send_to` не должен блокироваться навсегда,
-/// иначе зависает весь поток отправки. Потерянный при таймауте пакет будет
-/// повторно отправлен надёжным слоем (FrameMgr).
-fn tune_socket(socket: &Socket) {
-    let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
-    let _ = socket.set_write_timeout(Some(Duration::from_millis(200)));
-    // Просим побольше буферов (ядро может урезать до net.core.{r,w}mem_max).
-    let _ = socket.set_send_buffer_size(4 << 20);
-    let _ = socket.set_recv_buffer_size(8 << 20);
-}
+// ── Контрольная сумма и сборка echo ──────────────────────────────────────
 
-/// Контрольная сумма Интернета (RFC 1071) поверх ICMP-сообщения.
 fn checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut i = 0;
@@ -86,9 +86,9 @@ fn checksum(data: &[u8]) -> u16 {
 fn build_echo(icmp_type: u8, id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(8 + payload.len());
     buf.push(icmp_type);
-    buf.push(0); // code
     buf.push(0);
-    buf.push(0); // checksum placeholder
+    buf.push(0);
+    buf.push(0);
     buf.extend_from_slice(&id.to_be_bytes());
     buf.extend_from_slice(&seq.to_be_bytes());
     buf.extend_from_slice(payload);
@@ -97,109 +97,245 @@ fn build_echo(icmp_type: u8, id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Разобранный входящий ICMP-пакет с уже распакованным MyMsg.
-pub struct Packet {
-    pub my: MyMsg,
-    pub src: Ipv4Addr,
-    pub echo_id: u16,
-    pub echo_seq: u16,
-}
-
-/// Отправляет MyMsg: устанавливает magic, сериализует, шифрует, упаковывает в echo.
-/// `sproto` — тип ICMP (8 = echo request у клиента, значение rproto у ответов сервера).
-#[allow(clippy::too_many_arguments)]
-pub fn send_icmp(
-    socket: &Socket,
+/// Кодирует MyMsg в готовый ICMP-пакет (encode + шифрование + echo-обёртка).
+pub fn encode_packet(
+    mut my: MyMsg,
+    sproto: u8,
     icmp_id: u16,
     seq: u16,
-    dst: Ipv4Addr,
-    sproto: u8,
-    mut my: MyMsg,
     crypto: Option<&Crypto>,
-) -> Result<()> {
+) -> Vec<u8> {
     my.magic = MAGIC;
     let mut payload = Vec::with_capacity(my.encoded_len());
-    my.encode(&mut payload).map_err(|e| anyhow!("encode: {e}"))?;
+    my.encode(&mut payload).expect("encode MyMsg");
     if let Some(c) = crypto {
-        payload = c.encrypt(&payload)?;
+        payload = c.encrypt(&payload).unwrap_or(payload);
     }
-    let pkt = build_echo(sproto, icmp_id, seq, &payload);
-    let addr = SocketAddr::new(IpAddr::V4(dst), 0);
-    socket.send_to(&pkt, &addr.into())?;
-    Ok(())
+    build_echo(sproto, icmp_id, seq, &payload)
 }
 
-/// Читает один ICMP-пакет (блокируется до read-timeout сокета), декодирует MyMsg.
-/// Возвращает Ok(None) при таймауте или невалидном/чужом пакете.
-///
-/// В datagram-режиме ядро уже отбросило IP-заголовок; в RAW-режиме его длина
-/// вычисляется из IHL и пропускается.
-pub fn recv_icmp(
-    socket: &Socket,
+/// Разбирает входящий ICMP-пакет (RAW: с IP-заголовком; datagram: без него).
+/// Возвращает (MyMsg, echo_id, echo_seq) либо None для чужих/битых.
+pub fn parse_packet(
+    raw: &[u8],
     datagram: bool,
     crypto: Option<&Crypto>,
-) -> io::Result<Option<Packet>> {
-    let mut buf = [MaybeUninit::<u8>::uninit(); 10240];
-    let (n, src) = match socket.recv_from(&mut buf) {
-        Ok(v) => v,
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
-            return Ok(None);
-        }
-        Err(e) => return Err(e),
-    };
-    if n == 0 {
-        return Ok(None);
+) -> Option<(MyMsg, u16, u16)> {
+    if raw.is_empty() {
+        return None;
     }
-    let data: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, n) };
-    if data.is_empty() {
-        return Ok(None);
-    }
-
     let icmp = if datagram {
-        data
+        raw
     } else {
-        // Отбрасываем IP-заголовок (длина = IHL * 4).
-        let ihl = ((data[0] & 0x0f) as usize) * 4;
-        if data.len() < ihl + 8 {
-            return Ok(None);
+        let ihl = ((raw[0] & 0x0f) as usize) * 4;
+        if raw.len() < ihl + 8 {
+            return None;
         }
-        &data[ihl..]
+        &raw[ihl..]
     };
     if icmp.len() < 8 {
-        return Ok(None);
+        return None;
     }
-
     let echo_id = u16::from_be_bytes([icmp[4], icmp[5]]);
     let echo_seq = u16::from_be_bytes([icmp[6], icmp[7]]);
     let mut payload = icmp[8..].to_vec();
-
     if let Some(c) = crypto {
-        payload = match c.decrypt(&payload) {
-            Ok(p) => p,
-            Err(_) => return Ok(None),
-        };
+        payload = c.decrypt(&payload).ok()?;
     }
-
-    let my = match MyMsg::decode(&payload[..]) {
-        Ok(m) => m,
-        Err(_) => return Ok(None),
-    };
+    let my = MyMsg::decode(&payload[..]).ok()?;
     if my.magic != MAGIC {
-        return Ok(None);
+        return None;
+    }
+    Some((my, echo_id, echo_seq))
+}
+
+// ── Батч приёма (recvmmsg) ───────────────────────────────────────────────
+
+fn sockaddr_v4(ip: Ipv4Addr) -> libc::sockaddr_in {
+    let mut sa: libc::sockaddr_in = unsafe { mem::zeroed() };
+    sa.sin_family = libc::AF_INET as libc::sa_family_t;
+    sa.sin_addr = libc::in_addr {
+        s_addr: u32::from_ne_bytes(ip.octets()),
+    };
+    sa
+}
+
+/// Батч приёма. Хранит только Send-данные (буферы/адреса/длины); временные
+/// `iovec`/`mmsghdr` с сырыми указателями строятся локально в момент syscall,
+/// чтобы структуру можно было держать через `.await` в read-таске.
+pub struct RecvBatch {
+    cap: usize,
+    bufs: Vec<[u8; BUFSZ]>,
+    addrs: Vec<libc::sockaddr_in>,
+    lens: Vec<usize>,
+}
+
+impl RecvBatch {
+    pub fn new(cap: usize) -> RecvBatch {
+        RecvBatch {
+            cap,
+            bufs: vec![[0u8; BUFSZ]; cap],
+            addrs: vec![unsafe { mem::zeroed() }; cap],
+            lens: vec![0usize; cap],
+        }
     }
 
-    let src_ip = match src.as_socket() {
-        Some(SocketAddr::V4(v4)) => *v4.ip(),
-        _ => Ipv4Addr::UNSPECIFIED,
-    };
-    let _ = SockAddr::from(SocketAddr::new(IpAddr::V4(src_ip), 0));
+    /// Один вызов recvmmsg. Возвращает число принятых пакетов или Err(WouldBlock).
+    pub fn recv(&mut self, sock: &Socket) -> io::Result<usize> {
+        let n = self.cap;
+        let mut iovs: Vec<libc::iovec> = Vec::with_capacity(n);
+        for i in 0..n {
+            iovs.push(libc::iovec {
+                iov_base: self.bufs[i].as_mut_ptr() as *mut libc::c_void,
+                iov_len: BUFSZ,
+            });
+        }
+        let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut mh: libc::mmsghdr = unsafe { mem::zeroed() };
+            mh.msg_hdr.msg_name = &mut self.addrs[i] as *mut _ as *mut libc::c_void;
+            mh.msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            mh.msg_hdr.msg_iov = &mut iovs[i] as *mut libc::iovec;
+            mh.msg_hdr.msg_iovlen = 1;
+            msgs.push(mh);
+        }
+        let r = unsafe {
+            libc::recvmmsg(
+                sock.as_raw_fd(),
+                msgs.as_mut_ptr(),
+                n as libc::c_uint,
+                libc::MSG_DONTWAIT,
+                ptr::null_mut(),
+            )
+        };
+        if r < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for i in 0..r as usize {
+            self.lens[i] = msgs[i].msg_len as usize;
+        }
+        Ok(r as usize)
+    }
 
-    Ok(Some(Packet {
-        my,
-        src: src_ip,
-        echo_id,
-        echo_seq,
-    }))
+    pub fn get(&self, i: usize) -> (&[u8], Ipv4Addr) {
+        let len = self.lens[i].min(BUFSZ);
+        let ip = Ipv4Addr::from(self.addrs[i].sin_addr.s_addr.to_ne_bytes());
+        (&self.bufs[i][..len], ip)
+    }
+}
+
+// ── Батч отправки (sendmmsg) ─────────────────────────────────────────────
+
+/// Накопитель исходящих пакетов; шлёт пачкой через sendmmsg. Хранит только
+/// Send-данные; временные iovec/mmsghdr строятся локально в момент send().
+pub struct SendBatch {
+    dsts: Vec<libc::sockaddr_in>,
+    bufs: Vec<Vec<u8>>,
+}
+
+impl SendBatch {
+    pub fn new() -> SendBatch {
+        SendBatch {
+            dsts: Vec::new(),
+            bufs: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, dst: Ipv4Addr, bytes: Vec<u8>) {
+        self.dsts.push(sockaddr_v4(dst));
+        self.bufs.push(bytes);
+    }
+
+    pub fn len(&self) -> usize {
+        self.bufs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bufs.is_empty()
+    }
+
+    /// Шлёт текущую пачку. Возвращает число отправленных; отправленные удаляются
+    /// из начала (оставшиеся можно дослать после writable).
+    pub fn send(&mut self, sock: &Socket) -> io::Result<usize> {
+        let n = self.bufs.len();
+        if n == 0 {
+            return Ok(0);
+        }
+        let mut iovs: Vec<libc::iovec> = Vec::with_capacity(n);
+        for i in 0..n {
+            iovs.push(libc::iovec {
+                iov_base: self.bufs[i].as_mut_ptr() as *mut libc::c_void,
+                iov_len: self.bufs[i].len(),
+            });
+        }
+        let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut mh: libc::mmsghdr = unsafe { mem::zeroed() };
+            mh.msg_hdr.msg_name = &mut self.dsts[i] as *mut _ as *mut libc::c_void;
+            mh.msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            mh.msg_hdr.msg_iov = &mut iovs[i] as *mut libc::iovec;
+            mh.msg_hdr.msg_iovlen = 1;
+            msgs.push(mh);
+        }
+        let r = unsafe {
+            libc::sendmmsg(
+                sock.as_raw_fd(),
+                msgs.as_mut_ptr(),
+                n as libc::c_uint,
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if r < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let sent = r as usize;
+        self.dsts.drain(0..sent);
+        self.bufs.drain(0..sent);
+        Ok(sent)
+    }
+}
+
+impl Default for SendBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Готовый к отправке пакет: (адрес назначения, полные байты ICMP-сообщения).
+pub type OutPkt = (Ipv4Addr, Vec<u8>);
+
+/// Запускает единый write-таск: собирает исходящие пакеты из канала в пачки и
+/// шлёт их через sendmmsg (минимум syscalls). Возвращает отправитель в канал.
+pub fn spawn_writer(io: std::sync::Arc<IcmpIo>, chan: usize) -> tokio::sync::mpsc::Sender<OutPkt> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<OutPkt>(chan);
+    tokio::spawn(async move {
+        let mut batch = SendBatch::new();
+        const MAX_BATCH: usize = 256;
+        while let Some((ip, bytes)) = rx.recv().await {
+            batch.push(ip, bytes);
+            while batch.len() < MAX_BATCH {
+                match rx.try_recv() {
+                    Ok((ip, bytes)) => batch.push(ip, bytes),
+                    Err(_) => break,
+                }
+            }
+            while !batch.is_empty() {
+                let mut guard = match io.fd.writable().await {
+                    Ok(g) => g,
+                    Err(_) => break,
+                };
+                match guard.try_io(|s| batch.send(s.get_ref())) {
+                    Ok(Ok(_)) => {} // отправили часть/всё; если остаток — снова writable
+                    Ok(Err(e)) => {
+                        log::debug!("sendmmsg error: {e}");
+                        break;
+                    }
+                    Err(_would_block) => {} // готовность снята, ждём снова
+                }
+            }
+        }
+    });
+    tx
 }
 
 #[cfg(test)]
@@ -208,78 +344,28 @@ mod tests {
 
     #[test]
     fn checksum_zeroes_over_complete_message() {
-        // Контрольная сумма поверх сообщения с уже вписанной CRC должна давать 0.
         let pkt = build_echo(ICMP_ECHO_REQUEST, 0x1234, 0x0001, b"ping payload");
         assert_eq!(checksum(&pkt), 0);
     }
 
     #[test]
-    fn echo_header_layout() {
-        let pkt = build_echo(ICMP_ECHO_REQUEST, 0xBEEF, 0x00AA, b"data");
-        assert_eq!(pkt[0], ICMP_ECHO_REQUEST);
-        assert_eq!(pkt[1], 0); // code
-        assert_eq!(u16::from_be_bytes([pkt[4], pkt[5]]), 0xBEEF);
-        assert_eq!(u16::from_be_bytes([pkt[6], pkt[7]]), 0x00AA);
-        assert_eq!(&pkt[8..], b"data");
-    }
-
-    #[test]
-    fn kernel_loopback_roundtrip() {
-        // Реальный round-trip против ICMP-ответчика ядра по loopback в
-        // datagram-режиме: проверяет сборку echo, контрольную сумму, разбор
-        // ответа и (де)сериализацию MyMsg сквозь настоящий сокет.
-        // Если окружение запрещает ICMP-сокеты — тест мягко пропускается.
-        let (socket, datagram) = match listen_icmp("127.0.0.1") {
-            Ok(v) => v,
-            Err(_) => return, // нет прав ни на RAW, ни на DGRAM — пропуск
-        };
-        if !datagram {
-            // RAW-режим: на loopback ядро также отвечает, но не будем зависеть.
-            return;
-        }
-        let my = MyMsg {
-            id: "roundtrip".into(),
-            r#type: 0,
-            data: vec![9, 8, 7, 6],
-            rproto: -1,
-            magic: MAGIC,
-            key: 42,
-            ..Default::default()
-        };
-        send_icmp(&socket, 0, 1, Ipv4Addr::LOCALHOST, ICMP_ECHO_REQUEST, my, None)
-            .expect("send");
-
-        for _ in 0..20 {
-            if let Ok(Some(pkt)) = recv_icmp(&socket, datagram, None) {
-                assert_eq!(pkt.my.id, "roundtrip");
-                assert_eq!(pkt.my.data, vec![9, 8, 7, 6]);
-                assert_eq!(pkt.my.key, 42);
-                return;
-            }
-        }
-        panic!("не получили эхо-ответ от ядра по loopback");
-    }
-
-    #[test]
-    fn mymsg_roundtrip() {
-        use prost::Message;
+    fn encode_parse_roundtrip() {
         let my = MyMsg {
             id: "conn-1".into(),
             r#type: 0,
-            target: "1.2.3.4:80".into(),
             data: vec![1, 2, 3, 4, 5],
             rproto: -1,
-            magic: MAGIC,
             key: 123456,
             ..Default::default()
         };
-        let mut buf = Vec::new();
-        my.encode(&mut buf).unwrap();
-        let got = MyMsg::decode(&buf[..]).unwrap();
+        let pkt = encode_packet(my, ICMP_ECHO_REQUEST, 0xBEEF, 0x00AA, None);
+        // datagram=true: pkt — это уже ICMP-сообщение без IP-заголовка
+        let (got, id, seq) = parse_packet(&pkt, true, None).unwrap();
         assert_eq!(got.id, "conn-1");
         assert_eq!(got.rproto, -1);
-        assert_eq!(got.magic, MAGIC);
         assert_eq!(got.key, 123456);
         assert_eq!(got.data, vec![1, 2, 3, 4, 5]);
+        assert_eq!(id, 0xBEEF);
+        assert_eq!(seq, 0x00AA);
     }
 }

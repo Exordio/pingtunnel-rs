@@ -4,38 +4,7 @@ use anyhow::{anyhow, Result};
 use rand::RngCore;
 use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-/// Адаптивная пауза для циклов опроса: при активности — минимальная задержка,
-/// на простое растёт до максимума (аналог adaptiveLoopWait в оригинале).
-/// Снижает загрузку CPU при большом числе одновременных соединений.
-pub struct Backoff {
-    min: Duration,
-    max: Duration,
-    cur: Duration,
-}
-
-impl Backoff {
-    pub fn new(min_ms: u64, max_ms: u64) -> Backoff {
-        let min = Duration::from_millis(min_ms.max(1));
-        Backoff {
-            min,
-            max: Duration::from_millis(max_ms).max(min),
-            cur: min,
-        }
-    }
-
-    /// Сбросить к минимуму (вызывать при наличии работы).
-    pub fn reset(&mut self) {
-        self.cur = self.min;
-    }
-
-    /// Поспать текущую паузу и увеличить её вдвое (до максимума).
-    pub fn step(&mut self) {
-        std::thread::sleep(self.cur);
-        self.cur = (self.cur * 2).min(self.max);
-    }
-}
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn now_ns() -> i64 {
     SystemTime::now()

@@ -1,4 +1,4 @@
-//! pingtunnel — туннелирование TCP/UDP/SOCKS5 поверх ICMP.
+//! pingtunnel — туннелирование TCP/SOCKS5 поверх ICMP (async, tokio).
 //! Rust-порт https://github.com/esrrhs/pingtunnel.
 
 mod client;
@@ -18,114 +18,64 @@ use crypto::{Crypto, EncryptionMode};
 #[derive(Parser, Debug)]
 #[command(
     name = "pingtunnel",
-    about = "Туннелирование TCP/UDP/SOCKS5 трафика поверх ICMP (порт esrrhs/pingtunnel)",
+    about = "Туннелирование TCP/SOCKS5 трафика поверх ICMP (async, порт esrrhs/pingtunnel)",
     long_about = None
 )]
 struct Args {
     /// Режим: client или server
     #[arg(long = "type", value_name = "TYPE")]
     r#type: String,
-
-    /// Локальный адрес прослушивания (клиент)
     #[arg(short = 'l', long = "l", default_value = "")]
     listen: String,
-
-    /// Адрес целевого назначения (клиент)
     #[arg(short = 't', long = "t", default_value = "")]
     target: String,
-
-    /// Адрес сервера (клиент)
     #[arg(short = 's', long = "s", default_value = "")]
     server: String,
-
-    /// Адрес прослушивания ICMP-трафика
     #[arg(long = "icmp_l", default_value = "0.0.0.0")]
     icmp_listen: String,
-
-    /// Таймаут соединения, сек
     #[arg(long = "timeout", default_value_t = 60)]
     timeout: i32,
-
-    /// Числовой ключ-пароль (0..2147483647)
     #[arg(long = "key", default_value_t = 0)]
     key: i32,
-
-    /// Режим шифрования: aes128, aes256, chacha20
     #[arg(long = "encrypt", default_value = "")]
     encrypt: String,
-
-    /// Ключ шифрования (base64 или парольная фраза)
     #[arg(long = "encrypt-key", default_value = "")]
     encrypt_key: String,
-
-    /// Включить режим TCP
     #[arg(long = "tcp", default_value_t = 0)]
     tcp: i32,
-
-    /// Размер буфера TCP
-    #[arg(long = "tcp_bs", default_value_t = 1024 * 1024)]
+    /// Размер буфера TCP (на соединение, в каждую сторону)
+    #[arg(long = "tcp_bs", default_value_t = 256 * 1024)]
     tcp_bs: i32,
-
-    /// Максимальное окно TCP
-    #[arg(long = "tcp_mw", default_value_t = 20000)]
+    /// Максимальное окно (число фреймов в полёте)
+    #[arg(long = "tcp_mw", default_value_t = 2048)]
     tcp_mw: i32,
-
-    /// Время повторной отправки TCP, мс
     #[arg(long = "tcp_rst", default_value_t = 400)]
     tcp_rst: i32,
-
-    /// Порог сжатия данных TCP (0 — без сжатия)
     #[arg(long = "tcp_gz", default_value_t = 0)]
     tcp_gz: i32,
-
-    /// Печатать статистику TCP
-    #[arg(long = "tcp_stat", default_value_t = 0)]
-    tcp_stat: i32,
-
-    /// Уровень логирования
+    /// Размер кадра в байтах (0 = по умолчанию 888, маскировка под ping).
+    /// Крупнее = меньше пакетов/syscalls/CPU, но теряется маскировка и идёт
+    /// IP-фрагментация выше MTU. Ставится независимо на клиенте и сервере, напр. 8000.
+    #[arg(long = "jumbo", default_value_t = 0)]
+    jumbo: usize,
     #[arg(long = "loglevel", default_value = "info")]
     loglevel: String,
-
-    /// Не печатать вывод
     #[arg(long = "noprint", default_value_t = 0)]
     noprint: i32,
-
-    /// Включить SOCKS5
     #[arg(long = "sock5", default_value_t = 0)]
     sock5: i32,
-
-    /// Имя пользователя SOCKS5
     #[arg(long = "s5user", default_value = "")]
     s5user: String,
-
-    /// Пароль SOCKS5
     #[arg(long = "s5pass", default_value = "")]
     s5pass: String,
-
-    /// Максимум соединений (0 — без ограничения)
     #[arg(long = "maxconn", default_value_t = 0)]
     maxconn: i32,
-
-    /// Таймаут установления соединения сервером к цели, мс
     #[arg(long = "conntt", default_value_t = 1000)]
     conntt: i32,
-
-    /// Форвардинг TCP через прокси (socks5://host:port или http://host:port)
     #[arg(long = "forward", default_value = "")]
     forward: String,
-
-    /// SOCKS5-фильтр (не поддерживается в этом порте, см. README)
-    #[arg(long = "s5filter", default_value = "")]
-    s5filter: String,
-
-    /// Файл данных фильтра SOCKS5 (не используется)
-    #[arg(long = "s5ftfile", default_value = "GeoLite2-Country.mmdb")]
-    s5ftfile: String,
 }
 
-/// Совместимость с CLI оригинала (Go `flag`): длинные флаги там пишутся с одним
-/// дефисом (`-type`, `-sock5`, `-tcp`...). Превращаем `-name` в `--name` для
-/// многобуквенных имён, оставляя короткие `-l`/`-s`/`-t` и числа (`-1`) как есть.
 fn normalize_args() -> Vec<String> {
     std::env::args()
         .enumerate()
@@ -163,7 +113,6 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Проверка параметров шифрования.
     let mode = match EncryptionMode::parse(&args.encrypt) {
         Ok(m) => m,
         Err(e) => {
@@ -183,19 +132,22 @@ fn main() {
         }
     };
 
-    if !args.s5filter.is_empty() {
-        log::warn!(
-            "-s5filter не поддерживается в этом порте (требует GeoIP); весь трафик форвардится"
-        );
-    }
-
     log::info!("start... key {}", args.key);
 
-    let result = if args.r#type == "server" {
-        run_server(&args, crypto)
-    } else {
-        run_client(&args, crypto)
-    };
+    let workers = num_cpus::get().max(1);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    let result = rt.block_on(async move {
+        if args.r#type == "server" {
+            run_server(args, crypto).await
+        } else {
+            run_client(args, crypto).await
+        }
+    });
 
     if let Err(e) = result {
         log::error!("ERROR: {e}");
@@ -203,7 +155,15 @@ fn main() {
     }
 }
 
-fn run_server(args: &Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
+fn frame_size(jumbo: usize) -> usize {
+    if jumbo > 0 {
+        jumbo.clamp(256, 60000)
+    } else {
+        proto::FRAME_MAX_SIZE
+    }
+}
+
+async fn run_server(args: Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
     let forward = forward::parse_forward_url(&args.forward)?;
     if forward.is_some() {
         log::info!("Forward proxy configured: {}", args.forward);
@@ -213,12 +173,13 @@ fn run_server(args: &Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
         key: args.key,
         maxconn: args.maxconn,
         connect_timeout: args.conntt,
+        frame_size: frame_size(args.jumbo),
     };
     let srv = server::Server::new(cfg, crypto, forward)?;
-    srv.run()
+    srv.run().await
 }
 
-fn run_client(args: &Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
+async fn run_client(args: Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
     if args.listen.is_empty() || args.server.is_empty() {
         anyhow::bail!("client requires -l and -s");
     }
@@ -226,18 +187,15 @@ fn run_client(args: &Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
     if args.sock5 != 0 {
         tcp = 1;
     }
+    if tcp == 0 {
+        anyhow::bail!("в этой async-сборке поддержан только TCP/SOCKS5: задайте --tcp 1 или --sock5 1");
+    }
     if args.sock5 == 0 && args.target.is_empty() {
         anyhow::bail!("client requires -t (target) unless -sock5 is set");
     }
     if args.tcp_mw * 10 > proto::FRAME_MAX_ID {
         anyhow::bail!("tcp win too big, max = {}", proto::FRAME_MAX_ID / 10);
     }
-
-    let (buffersize, maxwin, resend, compress, stat) = if tcp > 0 {
-        (args.tcp_bs, args.tcp_mw, args.tcp_rst, args.tcp_gz, args.tcp_stat)
-    } else {
-        (0, 0, 0, 0, 0)
-    };
 
     let cfg = client::ClientConfig {
         listen: args.listen.clone(),
@@ -247,16 +205,15 @@ fn run_client(args: &Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
         key: args.key,
         icmp_listen: args.icmp_listen.clone(),
         tcpmode: tcp,
-        buffersize,
-        maxwin,
-        resend,
-        compress,
-        stat,
+        buffersize: args.tcp_bs,
+        maxwin: args.tcp_mw,
+        resend: args.tcp_rst,
+        compress: args.tcp_gz,
+        frame_size: frame_size(args.jumbo),
         sock5: args.sock5,
-        maxconn: args.maxconn,
         s5user: args.s5user.clone(),
         s5pass: args.s5pass.clone(),
     };
     let cli = client::Client::new(cfg, crypto)?;
-    cli.run()
+    cli.run().await
 }
