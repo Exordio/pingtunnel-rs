@@ -1,0 +1,17 @@
+# Стенд для профилирования клиента pingtunnel локально.
+# Сервер крутится на удалённом NL-хосте; клиент — здесь, в контейнере.
+# host-сеть, чтобы ICMP к серверу шёл без NAT; NET_RAW для RAW-ICMP, SYS_PTRACE для gdb/strace.
+services:
+  client:
+    build: .
+    image: pt-bench:latest
+    container_name: pt-bench
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ./pingtunnel:/work/pingtunnel:ro
+    command: sleep infinity
