@@ -89,7 +89,7 @@
 
 ## Сборка
 
-Требуется Rust (edition 2021) и `protoc` (Protocol Buffers compiler), который
+Требуется Rust (edition 2024, минимум 1.85) и `protoc` (Protocol Buffers compiler), который
 вызывается на этапе сборки для генерации Rust-кода из `.proto`.
 
 ```bash
