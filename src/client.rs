@@ -82,7 +82,7 @@ pub struct Client {
 impl Client {
     pub fn new(cfg: ClientConfig, crypto: Option<Crypto>) -> Result<Arc<Client>> {
         let (socket, datagram) = icmp::listen_icmp(&cfg.icmp_listen)?;
-        let io = Arc::new(IcmpIo::new(socket, datagram)?);
+        let io = Arc::new(IcmpIo::new(socket)?);
         let tx = icmp::spawn_writer(io.clone(), 8192);
         let server_ip = resolve_ipv4(&cfg.server)?;
         let id = (rand::random::<u16>() & 0x7fff).max(1);
