@@ -1,333 +1,342 @@
 # Pingtunnel-rs
 
+[Русский](README.ru.md) | **English**
 
-> Реализация **async (tokio)**: низкая память, event-driven, батчинг syscalls,
-> настраиваемый размер кадра (`--jumbo`). Поддержаны TCP, UDP, SOCKS5 (CONNECT и
+> An **async (tokio)** implementation: low memory, event-driven, syscall batching,
+> configurable frame size (`--jumbo`). Supports TCP, UDP, SOCKS5 (CONNECT and
 > UDP ASSOCIATE).
 
-Это переписанная на **Rust** версия оригинального проекта на Go
-[esrrhs/pingtunnel](https://github.com/esrrhs/pingtunnel). Протокол на уровне
-байтов совместим с оригиналом (protobuf-сообщения и формат фреймов сохранены),
-поэтому Rust- и Go-версии скорее всего могут взаимодействовать между собой. 
-**(Но это не точно, тк были внесены правки натягивающие код на реалии rust.)**
+This is a **Rust** rewrite of the original Go project
+[esrrhs/pingtunnel](https://github.com/esrrhs/pingtunnel). The on-the-wire
+protocol is byte-level compatible with the original (protobuf messages and the
+frame format are preserved), so the Rust and Go versions can most likely
+interoperate.
+**(But it is not guaranteed, since changes were made to adapt the code to Rust's
+realities.)**
 
-#### **По сути это тот же протокол и та же модель «TCP/UDP-over-ICMP», но переписанные на async-Rust с упором на: батчинг syscalls (меньше sys-CPU), отсутствие GC (ровная память), безмьютексный путь TCP-соединения. Цена — отброшены вспомогательные Go-фичи (GeoIP, pprof, пул-параметры). Узкое место у обеих версий одно и то же — pps (пакеты в секунду), а не ширина канала, поэтому главный рычаг скорости - --jumbo (крупнее кадр -> меньше пакетов -> ниже CPU).**
+#### **In essence it is the same protocol and the same "TCP/UDP-over-ICMP" model, but rewritten in async Rust with a focus on: syscall batching (less sys-CPU), no GC (flat memory profile), a mutex-free TCP connection path. The cost — auxiliary Go features were dropped (GeoIP, pprof, pool parameters). The bottleneck is the same for both versions — pps (packets per second), not bandwidth, so the main throughput lever is `--jumbo` (larger frame -> fewer packets -> lower CPU).**
 
-> ⚠️ **Только для исследований и обучения. Не используйте в противоправных целях.**
+> ⚠️ **For research and education only. Do not use for unlawful purposes.**
 
 ```
                  ICMP (echo request/reply)
-   ┌────────┐   с инкапсулированным TCP/UDP    ┌────────┐        ┌───────────────┐
-   │ client │ ───────────────────────────────▶│ server │ ─────▶│ целевой адрес │
+   ┌────────┐   with encapsulated TCP/UDP      ┌────────┐        ┌───────────────┐
+   │ client │ ───────────────────────────────▶│ server │ ─────▶│ target address│
    │ (-l)   │ ◀────────────────────────────── │        │◀───── │  (-t / SOCKS) │
    └────────┘                                  └────────┘        └───────────────┘
- локальный TCP/UDP/SOCKS5                  публичный IP        реальный сервис
+ local TCP/UDP/SOCKS5                       public IP            real service
 ```
 
-# Отличия ?
+# Differences?
 
-## 1. Язык и рантайм
+## 1. Language and runtime
 
-| Характеристика | Go-оригинал | Этот порт (Rust) |
+| Characteristic | Go original | This port (Rust) |
 |----------------|-------------|------------------|
-| Конкуренция | горутины + GC + планировщик Go | async-задачи на tokio, без GC |
-| Память | GC, пилообразный профиль, паузы | детерминированная, ~20–150 МБ, без пауз |
-| Накладные на соединение | горутина (стек ~KB) + каналы | tokio-task (дешевле горутины) |
+| Concurrency | goroutines + GC + Go scheduler | async tasks on tokio, no GC |
+| Memory | GC, sawtooth profile ~20-1000Mb+, pauses | deterministic, ~20–150 MB, no pauses |
+| Per-connection overhead | goroutine (stack ~KB) + channels | tokio task (cheaper than a goroutine) |
 
 
-## 2. Архитектура ввода-вывода (главное отличие по перфу)
-- Батчинг syscalls. Это ключевое. Go-версия делает «один syscall на пакет» (ReadFrom/WriteTo). Здесь — recvmmsg/sendmmsg: десятки ICMP-пакетов за один вызов ядра (icmp.rs). Именно это убирало основную долю sys-CPU на сервере (в комментарии к файлу — ~72%).
-- Модель тасков. Один read-таск принимает пачки и демультиплексирует по conn-id, один write-таск собирает исходящее и шлёт пачкой; каждое TCP-соединение — отдельная задача со своим FrameMgr (единоличный владелец, без Mutex вокруг состояния фреймов).
-- Модель тиков/времени. Go использует кэшированное «now» (обновляется отдельной горутиной) и грубый тик. В этом порте приведён цикл соединения к адаптивному тику (10мс при работе / 500мс на простое) и кэшированию времени в update() — раньше был busy-poll 1мс.
+## 2. I/O architecture (the main performance difference)
+- Syscall batching. This is the key part. The Go version does "one syscall per packet" (ReadFrom/WriteTo). Here — recvmmsg/sendmmsg: dozens of ICMP packets per single kernel call (icmp.rs). This is exactly what removed the bulk of sys-CPU on the server (per the file comment — ~72%).
+- Task model. A single read task receives batches and demultiplexes by conn-id, a single write task collects outgoing data and sends it in a batch; each TCP connection is a separate task with its own FrameMgr (sole owner, no Mutex around the frame state).
+- Tick/time model. Go uses a cached "now" (updated by a separate goroutine) and a coarse tick. In this port the connection loop was brought to an adaptive tick (10 ms while active / 500 ms when idle) and time caching in update() — previously it was a 1 ms busy-poll.
 
-## 3. Функциональные отличия (фичи)
-- ❌ GeoIP-фильтр SOCKS5 (--s5filter/--s5ftfile) не реализован — нужна база MaxMind + mmdb-ридер. Флаги принимаются для совместимости, но не фильтруют.
-- ❌ --profile (pprof) — это Go-инструмент, в Rust его нет.
-- ❌ --maxprt/--maxprb (параметры серверного пула обработки) не нужны — диспетчеризация прямая, без пула воркеров.
-- ✅ TCP-проброс, SOCKS5 CONNECT, чистый UDP, SOCKS5 UDP ASSOCIATE, форвардинг через socks5/http-прокси, шифрование (AES-128/256-GCM, ChaCha20-Poly1305).
+## 3. Functional differences (features)
+- ❌ SOCKS5 GeoIP filter (--s5filter/--s5ftfile) is not implemented — it needs a MaxMind database + an mmdb reader. The flags are accepted for compatibility but do not filter.
+- ❌ --profile (pprof) — this is a Go tool, there is no equivalent in Rust.
+- ❌ --maxprt/--maxprb (server processing pool parameters) are not needed — dispatching is direct, with no worker pool.
+- ✅ TCP forwarding, SOCKS5 CONNECT, plain UDP, SOCKS5 UDP ASSOCIATE, forwarding via a socks5/http proxy, encryption (AES-128/256-GCM, ChaCha20-Poly1305).
 
-## 4. Протокол и совместимость
-- Wire-формат сохранён — те же protobuf MyMsg/Frame/FrameData и логика фреймов, поэтому Rust- и Go-стороны в принципе могут общаться (но это не точно).
-- ID соединения — 32 hex-символа случайно (в Go — MD5). На протокол не влияет, это просто строковый ключ.
+## 4. Protocol and compatibility
+- The wire format is preserved — the same protobuf MyMsg/Frame/FrameData and the same frame logic, so the Rust and Go sides can in principle talk to each other (but it is not guaranteed).
+- The connection ID is 32 random hex characters (in Go — MD5). It does not affect the protocol, it is just a string key.
 
-## Содержание
+## Table of contents
 
-- [Как это работает](#как-это-работает)
-- [Сборка](#сборка)
-- [Права доступа (важно)](#права-доступа-важно)
-- [Использование](#использование)
-  - [Сервер](#сервер)
-  - [Клиент: SOCKS5](#клиент-socks5)
-  - [Клиент: проброс TCP](#клиент-проброс-tcp)
-  - [Клиент: проброс UDP](#клиент-проброс-udp)
-- [Шифрование](#шифрование)
-- [Форвардинг через прокси](#форвардинг-через-прокси)
-- [Все параметры командной строки](#все-параметры-командной-строки)
-- [Архитектура реализации](#архитектура-реализации)
-- [Тесты](#тесты)
-- [Отличия от Go-версии](#отличия-от-go-версии)
-- [Лицензия](#лицензия)
+- [How it works](#how-it-works)
+- [Building](#building)
+- [Permissions (important)](#permissions-important)
+- [Usage](#usage)
+  - [Server](#server)
+  - [Client: SOCKS5](#client-socks5)
+  - [Client: TCP forwarding](#client-tcp-forwarding)
+  - [Client: UDP forwarding](#client-udp-forwarding)
+- [Encryption](#encryption)
+- [Forwarding via a proxy](#forwarding-via-a-proxy)
+- [All command-line options](#all-command-line-options)
+- [Implementation architecture](#implementation-architecture)
+- [Tests](#tests)
+- [License](#license)
 
-## Как это работает
+## How it works
 
-Каждый пакет ICMP Echo несёт в своём payload сериализованное protobuf-сообщение
-`MyMsg` (идентификатор соединения, тип, целевой адрес, данные, ключ и т.д.),
-опционально зашифрованное. Клиент отправляет echo request (тип 8), сервер
-отвечает echo reply (тип 0).
+Every ICMP Echo packet carries in its payload a serialized protobuf message
+`MyMsg` (connection identifier, type, target address, data, key, etc.),
+optionally encrypted. The client sends an echo request (type 8), the server
+replies with an echo reply (type 0).
 
-Поскольку ICMP — ненадёжный канал без гарантий доставки и порядка, для **TCP**
-поверх него реализован собственный надёжный транспорт `FrameMgr`:
+Since ICMP is an unreliable channel with no delivery or ordering guarantees, for
+**TCP** a custom reliable transport `FrameMgr` is implemented on top of it:
 
-- скользящее окно и нумерация фреймов;
-- повторная отправка по таймауту и по запросу получателя (REQ);
-- кумулятивные подтверждения (ACK);
-- ping/pong для оценки RTT и heartbeat для контроля живости;
-- опциональное сжатие фреймов (zlib).
+- a sliding window and frame numbering;
+- retransmission on timeout and on receiver request (REQ);
+- cumulative acknowledgements (ACK);
+- ping/pong for RTT estimation and heartbeat for liveness control;
+- optional frame compression (zlib).
 
-Для **UDP** надёжный слой не используется — датаграммы передаются как есть
-(ненадёжно, как и сам UDP).
+For **UDP** the reliable layer is not used — datagrams are passed as-is
+(unreliably, just like UDP itself).
 
-## Сборка
+## Building
 
-Требуется Rust (edition 2024, минимум 1.85) и `protoc` (Protocol Buffers compiler), который
-вызывается на этапе сборки для генерации Rust-кода из `.proto`.
+Requires Rust (edition 2024, minimum 1.85) and `protoc` (the Protocol Buffers compiler),
+which is invoked at build time to generate Rust code from `.proto`.
 
 ```bash
-# Установка protoc (примеры)
+# Installing protoc (examples)
 #   Arch:   sudo pacman -S protobuf
 #   Debian: sudo apt install protobuf-compiler
 
 cargo build --release
-# бинарь: target/release/pingtunnel
+# binary: target/release/pingtunnel
 ```
 
-## Права доступа (важно)
+## Permissions (important)
 
-Для приёма/отправки ICMP сервер открывает **RAW-сокет**, что требует прав
-`root` или capability `CAP_NET_RAW`:
+To receive/send ICMP the server opens a **RAW socket**, which requires `root`
+privileges or the `CAP_NET_RAW` capability:
 
 ```bash
-# вариант 1 — запуск под root
+# option 1 — run as root
 sudo ./target/release/pingtunnel --type server --key 123456
 
-# вариант 2 — выдать capability бинарю (тогда без sudo)
+# option 2 — grant the capability to the binary (then no sudo needed)
 sudo setcap cap_net_raw+ep ./target/release/pingtunnel
 ./target/release/pingtunnel --type server --key 123456
 ```
 
-**Клиент** дополнительно умеет работать без привилегий: если RAW-сокет
-недоступен, он автоматически откатывается на непривилегированный
-ICMP datagram-сокет (если `net.ipv4.ping_group_range` это разрешает — на
-большинстве дистрибутивов разрешено по умолчанию). Это аналог android-режима
-оригинала. Серверу datagram-режим не подходит — ему нужен RAW.
+The **client** can additionally work without privileges: if a RAW socket is
+unavailable, it automatically falls back to an unprivileged ICMP datagram socket
+(if `net.ipv4.ping_group_range` allows it — on most distributions it is allowed
+by default). This is the equivalent of the original's android mode. The datagram
+mode does not work for the server — it needs RAW.
 
-(Опционально) отключить системные ответы ядра на ping, чтобы они не мешали:
+(Optional) disable the kernel's own ping replies so they don't interfere:
 
 ```bash
 echo 1 | sudo tee /proc/sys/net/ipv4/icmp_echo_ignore_all
 ```
 
-## Использование
+## Usage
 
-### Сервер
+### Server
 
 ```bash
 sudo ./pingtunnel --type server --key 123456
 ```
 
-### Клиент: SOCKS5
+### Client: SOCKS5
 
-Поднимает локальный SOCKS5-прокси, весь трафик которого идёт через ICMP-туннель
-до сервера (TCP включается неявно):
+Brings up a local SOCKS5 proxy whose entire traffic goes through the ICMP tunnel
+to the server (TCP is enabled implicitly):
 
 ```bash
-./pingtunnel --type client -l :1080 -s СЕРВЕР --sock5 1 --key 123456
+./pingtunnel --type client -l :1080 -s SERVER --sock5 1 --key 123456
 ```
 
-С аутентификацией:
+With authentication:
 
 ```bash
-./pingtunnel --type client -l :1080 -s СЕРВЕР --sock5 1 \
+./pingtunnel --type client -l :1080 -s SERVER --sock5 1 \
              --s5user user --s5pass pass --key 123456
 ```
 
-### Клиент: проброс TCP
+### Client: TCP forwarding
 
-Весь трафик на локальный порт `4455` пробрасывается на `СЕРВЕР:4455`:
+All traffic to local port `4455` is forwarded to `SERVER:4455`:
 
 ```bash
-./pingtunnel --type client -l :4455 -s СЕРВЕР -t СЕРВЕР:4455 --tcp 1 --key 123456
+./pingtunnel --type client -l :4455 -s SERVER -t SERVER:4455 --tcp 1 --key 123456
 ```
 
-### Клиент: проброс UDP
+### Client: UDP forwarding
 
 ```bash
-./pingtunnel --type client -l :4455 -s СЕРВЕР -t СЕРВЕР:4455 --key 123456
+./pingtunnel --type client -l :4455 -s SERVER -t SERVER:4455 --key 123456
 ```
 
-> Здесь `СЕРВЕР` — публичный IP или домен машины с запущенным сервером,
-> а `-t` — конечный адрес, куда сервер пробросит трафик.
+> Here `SERVER` is the public IP or domain of the machine running the server,
+> and `-t` is the destination address the server will forward traffic to.
 
-## Шифрование
+## Encryption
 
-Payload ICMP можно шифровать AEAD-шифром. Поддерживаются `aes128`, `aes256`,
-`chacha20`. Ключ задаётся как base64 нужной длины **или** как парольная фраза
-(тогда ключ выводится через PBKDF2-HMAC-SHA256). Режим и ключ должны совпадать
-на клиенте и сервере:
+The ICMP payload can be encrypted with an AEAD cipher. Supported: `aes128`,
+`aes256`, `chacha20`. The key is given as base64 of the required length **or** as
+a passphrase (in which case the key is derived via PBKDF2-HMAC-SHA256). The mode
+and key must match on the client and the server:
 
 ```bash
-# сервер
+# server
 sudo ./pingtunnel --type server --key 123456 \
-     --encrypt chacha20 --encrypt-key "моя-секретная-фраза"
+     --encrypt chacha20 --encrypt-key "my-secret-phrase"
 
-# клиент
-./pingtunnel --type client -l :1080 -s СЕРВЕР --sock5 1 --key 123456 \
-     --encrypt chacha20 --encrypt-key "моя-секретная-фраза"
+# client
+./pingtunnel --type client -l :1080 -s SERVER --sock5 1 --key 123456 \
+     --encrypt chacha20 --encrypt-key "my-secret-phrase"
 ```
 
-## Форвардинг через прокси
+## Forwarding via a proxy
 
-Сервер может пробрасывать исходящие соединения не напрямую, а через внешний
-прокси (`socks5` или `http` CONNECT):
+The server can forward outgoing connections not directly, but through an
+external proxy (`socks5` or `http` CONNECT):
 
 ```bash
 sudo ./pingtunnel --type server --key 123456 --forward socks5://localhost:2080
 sudo ./pingtunnel --type server --key 123456 --forward http://localhost:8080
 ```
 
-UDP-форвардинг через прокси поддерживается только для `socks5` (UDP ASSOCIATE).
+UDP forwarding via a proxy is supported only for `socks5` (UDP ASSOCIATE).
 
-## Все параметры командной строки
+## All command-line options
 
-| Параметр        | Назначение                                                        | По умолчанию             |
+| Option          | Purpose                                                            | Default                  |
 |-----------------|-------------------------------------------------------------------|--------------------------|
-| `--type`        | `client` или `server`                                             | —                        |
-| `-l`            | локальный адрес прослушивания (клиент)                            | —                        |
-| `-s`            | адрес сервера (клиент)                                            | —                        |
-| `-t`            | целевой адрес, куда сервер пробрасывает трафик                    | —                        |
-| `--icmp_l`      | адрес прослушивания ICMP                                          | `0.0.0.0`                |
-| `--timeout`     | таймаут соединения, сек                                           | `60`                     |
-| `--key`         | числовой ключ-пароль (0..2147483647)                             | `0`                      |
-| `--encrypt`     | режим шифрования: `aes128`/`aes256`/`chacha20`                    | (выкл.)                  |
-| `--encrypt-key` | ключ шифрования (base64 или парольная фраза)                      | —                        |
-| `--tcp`         | включить режим TCP (`1`)                                          | `0`                      |
-| `--tcp_bs`      | размер буфера TCP (на соединение, в каждую сторону)               | `262144`                 |
-| `--tcp_mw`      | максимальное окно (фреймов в полёте)                              | `2048`                   |
-| `--tcp_rst`     | время повторной отправки TCP, мс                                 | `400`                    |
-| `--tcp_gz`      | порог сжатия данных TCP (0 — выкл.)                               | `0`                      |
-| `--jumbo`       | размер кадра, Б (0 = 888; крупнее = меньше пакетов/CPU, напр. 8000) | `0`                    |
-| `--sock5`       | включить SOCKS5 (неявно включает TCP)                            | `0`                      |
-| `--s5user`      | имя пользователя SOCKS5                                           | (без аутентификации)     |
-| `--s5pass`      | пароль SOCKS5                                                    | (без аутентификации)     |
-| `--maxconn`     | максимум соединений (0 — без ограничения)                        | `0`                      |
-| `--conntt`      | таймаут подключения сервера к цели, мс                           | `1000`                   |
-| `--forward`     | форвардинг через прокси (`socks5://…` / `http://…`)              | (выкл.)                  |
-| `--loglevel`    | уровень логирования (`debug`/`info`/`warn`/`error`)             | `info`                   |
-| `--noprint`     | не печатать вывод (`1`)                                          | `0`                      |
-| `--s5filter`    | GeoIP-фильтр SOCKS5 — **не поддерживается** (см. отличия)         | (выкл.)                  |
-| `--s5ftfile`    | файл данных GeoIP — не используется                              | —                        |
+| `--type`        | `client` or `server`                                              | —                        |
+| `-l`            | local listen address (client)                                     | —                        |
+| `-s`            | server address (client)                                           | —                        |
+| `-t`            | target address the server forwards traffic to                     | —                        |
+| `--icmp_l`      | ICMP listen address                                               | `0.0.0.0`                |
+| `--timeout`     | connection timeout, sec                                           | `60`                     |
+| `--key`         | numeric key/password (0..2147483647)                              | `0`                      |
+| `--encrypt`     | encryption mode: `aes128`/`aes256`/`chacha20`                     | (off)                    |
+| `--encrypt-key` | encryption key (base64 or passphrase)                             | —                        |
+| `--tcp`         | enable TCP mode (`1`)                                             | `0`                      |
+| `--tcp_bs`      | TCP buffer size (per connection, each direction)                  | `262144`                 |
+| `--tcp_mw`      | maximum window (frames in flight)                                 | `2048`                   |
+| `--tcp_rst`     | TCP retransmission time, ms                                       | `400`                    |
+| `--tcp_gz`      | TCP data compression threshold (0 — off)                          | `0`                      |
+| `--jumbo`       | frame size, B (0 = 888; larger = fewer packets/CPU, e.g. 8000)    | `0`                      |
+| `--sock5`       | enable SOCKS5 (implicitly enables TCP)                            | `0`                      |
+| `--s5user`      | SOCKS5 username                                                   | (no authentication)      |
+| `--s5pass`      | SOCKS5 password                                                   | (no authentication)      |
+| `--maxconn`     | maximum connections (0 — unlimited)                              | `0`                      |
+| `--conntt`      | server-to-target connect timeout, ms                             | `1000`                   |
+| `--forward`     | forwarding via a proxy (`socks5://…` / `http://…`)                | (off)                    |
+| `--loglevel`    | log level (`debug`/`info`/`warn`/`error`)                        | `info`                   |
+| `--noprint`     | do not print output (`1`)                                        | `0`                      |
+| `--s5filter`    | SOCKS5 GeoIP filter — **not supported** (see differences)         | (off)                    |
+| `--s5ftfile`    | GeoIP data file — not used                                       | —                        |
 
-## Производительность и тюнинг
+## Performance and tuning
 
-Узкое место ICMP-туннеля — **не ширина канала, а packets-per-second (pps)**:
-каждый кадр едет отдельным ICMP-пакетом, и потолок упирается в то, сколько
-пакетов в секунду успевает обработать ядро/CPU. На практике один TCP-поток
-уверенно даёт **~50 Мбит/с (~6 МБ/с)** даже дефолтным кадром 888 Б (замер через
-WAN ~44 мс RTT до 1-vCPU сервера) — и заметно больше при меньшем RTT, свободном
-CPU, поднятых буферах, `--jumbo` или нескольких потоках.
+The bottleneck of an ICMP tunnel is **not bandwidth, but packets-per-second
+(pps)**: every frame travels as a separate ICMP packet, and the ceiling is hit
+by how many packets per second the kernel/CPU can process. In practice a single
+TCP stream reliably delivers **~50 Mbit/s (~6 MB/s)** even with the default
+888 B frame (measured over WAN ~44 ms RTT to a 1-vCPU server) — and noticeably
+more with lower RTT, free CPU, raised buffers, `--jumbo`, or multiple streams.
 
-Чтобы выжать максимум, на **сервере и клиенте** (Linux) полезно поднять буферы
-и снять встроенные лимиты ICMP. Создайте `/etc/sysctl.d/99-pingtunnel.conf`:
+To squeeze out the maximum, on **both the server and the client** (Linux) it
+helps to raise the buffers and remove the built-in ICMP limits. Create
+`/etc/sysctl.d/99-pingtunnel.conf`:
 
 ```ini
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 net.core.rmem_default = 262144
 net.core.wmem_default = 262144
-# очередь входящих пакетов — чтобы ОС не дропала ICMP при наплыве
+# incoming packet queue — so the OS does not drop ICMP under a burst
 net.core.netdev_max_backlog = 10000
-# снять лимит на частоту ICMP
+# remove the ICMP rate limit
 net.ipv4.icmp_ratelimit = 0
 net.ipv4.icmp_ratemask = 0
 ```
 
-Применить: `sudo sysctl -p /etc/sysctl.d/99-pingtunnel.conf`.
+Apply: `sudo sysctl -p /etc/sysctl.d/99-pingtunnel.conf`.
 
-> Без поднятия `rmem_max/wmem_max` ядро по умолчанию режет буфер сокета до
-> ~200 КБ, что мешает держать окно при заметном RTT.
+> Without raising `rmem_max/wmem_max`, the kernel by default caps the socket
+> buffer at ~200 KB, which makes it hard to hold the window at a noticeable RTT.
 
-**Главный «хак» под throughput — крупнее кадр** (`--jumbo N`): меньше пакетов на
-байт → меньше pps → ниже CPU и выше потолок. По умолчанию кадр 888 Б (маскировка
-под обычный ping). Ориентиры на один поток (зависят от RTT/CPU/линка — **реально
-может быть больше**):
+**The main throughput "hack" is a larger frame** (`--jumbo N`): fewer packets per
+byte → fewer pps → lower CPU and a higher ceiling. By default the frame is 888 B
+(masquerading as a regular ping). Single-stream guidelines (depend on
+RTT/CPU/link — **it may actually be higher**):
 
-| `--jumbo` | один поток | примечание |
-|-----------|-----------|------------|
-| 0 (888 Б) | **~50 Мбит/с (~6 МБ/с)** | дефолт, маскировка под ping; замер через WAN ~44 мс RTT |
-| 1400      | выше | ровно под MTU, без фрагментации |
-| 8000      | ещё выше | лучший single-stream; >MTU → IP-фрагментация. (возможны потери) |
+| `--jumbo` | single stream | note |
+|-----------|--------------|------|
+| 0 (888 B) | **~50 Mbit/s (~6 MB/s)** | default, masquerades as a ping; measured over WAN ~44 ms RTT |
+| 1400      | higher | exactly at MTU, no fragmentation |
+| 8000      | even higher | best single-stream; >MTU → IP fragmentation. (losses possible) |
 
-<details>
-  <summary>Yandex SpeedTeest -jumbo 1400</summary>
+
+### speedtest.net -jumbo 1400 server 1vCpu 2.3hz
+<img width="505" height="205" alt="image" src="https://github.com/user-attachments/assets/ec39b50a-b938-430a-8049-d12bffed81be" />
+
+
+### yandex speedtest -jumbo 1400 server 1vCpu 2.3hz
 <img width="1159" height="562" alt="image" src="https://github.com/user-attachments/assets/83213fa5-b431-4b36-a025-720c401f8a80" />
-</details>
 
-Ставится **независимо** на клиенте и сервере (каждая сторона нарезает свой
-поток отправки). Цена крупного кадра: теряется маскировка под ping, а выше MTU
-идёт IP-фрагментация (потеря одного фрагмента теряет весь кадр → под высокой
-конкуррентностью растут ретрансмиты). Оптимум обычно 1400 (без фрагментации)
-или 8000 (для одиночных потоков).
 
-## Архитектура реализации
+It is set **independently** on the client and the server (each side slices its
+own send stream). The cost of a large frame: the ping masquerade is lost, and
+above MTU there is IP fragmentation (losing one fragment loses the whole frame →
+under high concurrency retransmits grow). The optimum is usually 1400 (no
+fragmentation) or 8000 (for single streams).
 
-| Файл                 | Назначение                                                            |
-|----------------------|-----------------------------------------------------------------------|
-| `src/main.rs`        | разбор аргументов (clap), запуск клиента или сервера                  |
-| `src/proto.rs`       | сгенерированные protobuf-типы (`MyMsg`, `Frame`, `FrameData`) и константы |
-| `src/icmp.rs`        | ICMP raw/datagram-сокет, сборка/разбор echo, упаковка `MyMsg`, шифрование payload |
-| `src/framemgr.rs`    | надёжный транспорт поверх ICMP (скользящее окно, ACK/REQ, ping/pong, heartbeat, сжатие) |
-| `src/ring.rs`        | кольцевые буферы: байтовый (`RBuffer`) и по id фреймов (`ROBuffer`)   |
-| `src/crypto.rs`      | AES-128/256-GCM, ChaCha20-Poly1305, вывод ключа (base64/PBKDF2)       |
-| `src/icmp.rs`        | async ICMP-сокет (`AsyncFd`), батчинг `recvmmsg`/`sendmmsg`, сборка echo, `MyMsg` |
-| `src/socks5.rs`      | SOCKS5: async-рукопожатие, разбор запросов, кодирование адресов, UDP-датаграммы |
-| `src/forward.rs`     | async-форвардинг через socks5/http-прокси                            |
-| `src/client.rs`      | клиент: приём локальных TCP/UDP/SOCKS5, туннелирование в ICMP         |
-| `src/server.rs`      | сервер: приём ICMP, подключение к целям (TCP/UDP, напрямую или через прокси) |
-| `src/util.rs`        | время, генерация id соединений, резолвинг адресов, счётчики           |
+## Implementation architecture
 
-**Модель — async на tokio** (worker-пул = числу ядер). Каждое соединение — это
-задача (а не ОС-поток), работает по событиям (входящий фрейм / локальные данные /
-таймер), без busy-poll. Один read-таск принимает ICMP пачками (`recvmmsg`) и
-демультиплексирует по conn-id; один write-таск собирает исходящее и шлёт пачкой
-(`sendmmsg`). Для **TCP** каждое соединение держит `FrameMgr` (надёжная доставка,
-единоличный владелец без `Mutex`); для **UDP** — прямой проброс датаграмм без
-надёжного слоя (как и в оригинале). Память ~20–150 МБ (зависит от числа соединений).
+| File                 | Purpose                                                              |
+|----------------------|---------------------------------------------------------------------|
+| `src/main.rs`        | argument parsing (clap), launching the client or the server         |
+| `src/proto.rs`       | generated protobuf types (`MyMsg`, `Frame`, `FrameData`) and constants |
+| `src/icmp.rs`        | ICMP raw/datagram socket, building/parsing echo, packing `MyMsg`, payload encryption |
+| `src/framemgr.rs`    | reliable transport over ICMP (sliding window, ACK/REQ, ping/pong, heartbeat, compression) |
+| `src/ring.rs`        | ring buffers: byte (`RBuffer`) and by frame id (`ROBuffer`)         |
+| `src/crypto.rs`      | AES-128/256-GCM, ChaCha20-Poly1305, key derivation (base64/PBKDF2)  |
+| `src/icmp.rs`        | async ICMP socket (`AsyncFd`), `recvmmsg`/`sendmmsg` batching, echo assembly, `MyMsg` |
+| `src/socks5.rs`      | SOCKS5: async handshake, request parsing, address encoding, UDP datagrams |
+| `src/forward.rs`     | async forwarding via a socks5/http proxy                            |
+| `src/client.rs`      | client: accepting local TCP/UDP/SOCKS5, tunneling into ICMP         |
+| `src/server.rs`      | server: receiving ICMP, connecting to targets (TCP/UDP, directly or via a proxy) |
+| `src/util.rs`        | time, connection id generation, address resolution, counters        |
 
-Поддержаны: **TCP-проброс**, **SOCKS5 CONNECT** (TCP), **чистый UDP-проброс**
-(`-l :порт -t host:порт` без `--tcp`/`--sock5`) и **SOCKS5 UDP ASSOCIATE**.
+**The model is async on tokio** (worker pool = number of cores). Each connection
+is a task (not an OS thread), driven by events (incoming frame / local data /
+timer), with no busy-poll. A single read task receives ICMP in batches
+(`recvmmsg`) and demultiplexes by conn-id; a single write task collects outgoing
+data and sends it in a batch (`sendmmsg`). For **TCP** each connection holds a
+`FrameMgr` (reliable delivery, sole owner without a `Mutex`); for **UDP** —
+direct datagram forwarding without a reliable layer (as in the original). Memory
+~20–150 MB (depends on the number of connections).
 
-## Тесты
+Supported: **TCP forwarding**, **SOCKS5 CONNECT** (TCP), **plain UDP forwarding**
+(`-l :port -t host:port` without `--tcp`/`--sock5`) and **SOCKS5 UDP ASSOCIATE**.
+
+## Tests
 
 ```bash
 cargo test
 ```
 
-Покрытие (21 тест, не требуют привилегий):
+Coverage (21 tests, no privileges required):
 
-- **`framemgr`** — петлевой обмен двух `FrameMgr`: рукопожатие, многокадровый
-  поток в обе стороны, **восстановление после потери ~1/3 фреймов**, сжатие;
-- **`icmp`** — контрольная сумма, раскладка echo-заголовка, round-trip `MyMsg`,
-  а также **реальный round-trip против ICMP-ответчика ядра** по loopback;
-- **`crypto`** — round-trip для всех трёх режимов, отказ при неверном ключе;
-- **`ring`** — кольцевые буферы (перенос через край, переполнение, окно id);
-- **`socks5`** — кодирование/разбор адресов и UDP-датаграмм.
+- **`framemgr`** — loopback exchange between two `FrameMgr` instances: handshake,
+  a multi-frame stream in both directions, **recovery after losing ~1/3 of the
+  frames**, compression;
+- **`icmp`** — checksum, echo header layout, `MyMsg` round-trip, and also a
+  **real round-trip against the kernel's ICMP responder** over loopback;
+- **`crypto`** — round-trip for all three modes, failure on a wrong key;
+- **`ring`** — ring buffers (wrap-around, overflow, id window);
+- **`socks5`** — address and UDP datagram encoding/parsing.
 
-Полный сквозной тест туннеля требует прав на RAW-сокеты для сервера:
+A full end-to-end tunnel test requires RAW-socket privileges for the server:
 
 ```bash
-sudo ./scripts/e2e_test.sh        # или после setcap — без sudo
+sudo ./scripts/e2e_test.sh        # or, after setcap — without sudo
 ```
 
-## Лицензия
+## License
 
-MIT — как и у оригинального проекта.
+MIT — same as the original project.
