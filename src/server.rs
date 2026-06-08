@@ -89,7 +89,7 @@ impl Server {
         if datagram {
             log::warn!("сервер в datagram-режиме: echo request не доставляется, нужен RAW (root)");
         }
-        let io = Arc::new(IcmpIo::new(socket, datagram)?);
+        let io = Arc::new(IcmpIo::new(socket)?);
         let tx = icmp::spawn_writer(io.clone(), 8192);
         Ok(Arc::new(Server {
             cfg,

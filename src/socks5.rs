@@ -3,7 +3,6 @@
 //! и упаковка/разбор UDP-датаграмм SOCKS5. Порт socks5.go и gohome Sock5HandshakeBy.
 
 use anyhow::{anyhow, bail, Result};
-use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -25,50 +24,6 @@ const AUTH_VERSION: u8 = 0x01;
 pub struct Socks5Request {
     pub command: u8,
     pub address: String,
-}
-
-fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<()> {
-    r.read_exact(buf).map_err(|e| anyhow!("read: {e}"))
-}
-
-/// Серверное рукопожатие SOCKS5. Поддерживает no-auth и user/pass.
-pub fn server_handshake<S: Read + Write>(
-    conn: &mut S,
-    username: &str,
-    password: &str,
-) -> Result<()> {
-    let mut head = [0u8; 2];
-    read_full(conn, &mut head)?;
-    if head[0] != SOCKS5_VERSION {
-        bail!("socks version not supported: {}", head[0]);
-    }
-    let nmethod = head[1] as usize;
-    let mut methods = vec![0u8; nmethod];
-    read_full(conn, &mut methods)?;
-
-    if username.is_empty() && password.is_empty() {
-        conn.write_all(&[SOCKS5_VERSION, 0x00])?; // no auth
-    } else {
-        conn.write_all(&[SOCKS5_VERSION, 0x02])?; // user/pass
-        let mut header = [0u8; 2];
-        read_full(conn, &mut header)?;
-        if header[0] != AUTH_VERSION {
-            bail!("unsupported auth version: {}", header[0]);
-        }
-        let ulen = header[1] as usize;
-        let mut user = vec![0u8; ulen];
-        read_full(conn, &mut user)?;
-        let mut plen = [0u8; 1];
-        read_full(conn, &mut plen)?;
-        let mut pass = vec![0u8; plen[0] as usize];
-        read_full(conn, &mut pass)?;
-        let ok = user == username.as_bytes() && pass == password.as_bytes();
-        conn.write_all(&[AUTH_VERSION, if ok { 0x00 } else { 0x01 }])?;
-        if !ok {
-            bail!("socks5 auth failed");
-        }
-    }
-    Ok(())
 }
 
 // ── Async-версии (tokio) ─────────────────────────────────────────────────
@@ -182,74 +137,6 @@ pub async fn write_reply_async<S: AsyncWrite + Unpin>(
     reply.extend_from_slice(&[SOCKS5_VERSION, rep, 0x00]);
     reply.extend_from_slice(&encoded);
     conn.write_all(&reply).await?;
-    Ok(())
-}
-
-/// Читает запрос SOCKS5 (после рукопожатия): команда + адрес назначения.
-pub fn read_request<R: Read>(r: &mut R) -> Result<Socks5Request> {
-    let mut header = [0u8; 4];
-    read_full(r, &mut header)?;
-    if header[0] != SOCKS5_VERSION {
-        bail!("unsupported socks version: {}", header[0]);
-    }
-    if header[2] != 0x00 {
-        bail!("invalid socks reserved byte: {}", header[2]);
-    }
-    let addr = read_address(r, header[3])?;
-    Ok(Socks5Request {
-        command: header[1],
-        address: addr,
-    })
-}
-
-/// Читает адрес из потока по типу адреса (используется и в запросе, и в ответах).
-pub fn read_address<R: Read>(r: &mut R, atyp: u8) -> Result<String> {
-    match atyp {
-        ATYP_IPV4 => {
-            let mut buf = [0u8; 4 + 2];
-            read_full(r, &mut buf)?;
-            let ip = std::net::Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
-            let port = u16::from_be_bytes([buf[4], buf[5]]);
-            Ok(format!("{ip}:{port}"))
-        }
-        ATYP_IPV6 => {
-            let mut buf = [0u8; 16 + 2];
-            read_full(r, &mut buf)?;
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&buf[..16]);
-            let ip = std::net::Ipv6Addr::from(octets);
-            let port = u16::from_be_bytes([buf[16], buf[17]]);
-            Ok(format!("[{ip}]:{port}"))
-        }
-        ATYP_DOMAIN => {
-            let mut lb = [0u8; 1];
-            read_full(r, &mut lb)?;
-            let dlen = lb[0] as usize;
-            if dlen == 0 {
-                bail!("invalid empty domain");
-            }
-            let mut buf = vec![0u8; dlen + 2];
-            read_full(r, &mut buf)?;
-            let host = String::from_utf8_lossy(&buf[..dlen]).to_string();
-            let port = u16::from_be_bytes([buf[dlen], buf[dlen + 1]]);
-            Ok(format!("{host}:{port}"))
-        }
-        other => bail!("unsupported socks5 address type: {other}"),
-    }
-}
-
-/// Пишет ответ SOCKS5 (VER REP RSV ATYP BND.ADDR BND.PORT).
-pub fn write_reply<W: Write>(w: &mut W, rep: u8, bind_addr: &str) -> Result<()> {
-    let bind_addr = if bind_addr.is_empty() {
-        "0.0.0.0:0"
-    } else {
-        bind_addr
-    };
-    let encoded = encode_address(bind_addr)?;
-    let mut reply = Vec::with_capacity(3 + encoded.len());
-    reply.extend_from_slice(&[SOCKS5_VERSION, rep, 0x00]);
-    reply.extend_from_slice(&encoded);
-    w.write_all(&reply)?;
     Ok(())
 }
 
