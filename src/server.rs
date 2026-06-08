@@ -415,6 +415,10 @@ impl Server {
 
         loop {
             let connected = fm.is_connected();
+            // См. client.rs: читаем не больше, чем влезет в send-буфер, иначе
+            // RBuffer::write отбрасывает излишек (потеря данных, нет backpressure).
+            let send_left = fm.get_send_buffer_left();
+            let read_cap = send_left.min(rbuf.len());
             let tick = if fm.has_pending_work() { ACTIVE_TICK } else { IDLE_TICK };
             tokio::select! {
                 m = rx.recv() => {
@@ -436,7 +440,7 @@ impl Server {
                         Some(Incoming::Kick) | None => fm.close(),
                     }
                 }
-                r = rd.read(&mut rbuf), if connected && !local_eof && fm.get_send_buffer_left() > 0 => {
+                r = rd.read(&mut rbuf[..read_cap]), if connected && !local_eof && send_left > 0 => {
                     match r {
                         Ok(0) => { local_eof = true; fm.close(); }
                         Ok(n) => { fm.write_send_buffer(&rbuf[..n]); }
