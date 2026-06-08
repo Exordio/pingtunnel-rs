@@ -1,7 +1,7 @@
 //! Мелкие утилиты: время, генерация уникального id соединения, резолвинг адресов.
 
 use anyhow::{anyhow, Result};
-use rand::RngCore;
+use rand::Rng;
 use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,7 +16,7 @@ pub fn now_ns() -> i64 {
 /// Уникальный идентификатор соединения (32 hex-символа).
 pub fn unique_id() -> String {
     let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
+    rand::rng().fill_bytes(&mut b);
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 

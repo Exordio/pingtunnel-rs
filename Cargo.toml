@@ -13,24 +13,25 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros", "signal"] }
 libc = "0.2"
 num_cpus = "1"
-prost = "0.13"
-socket2 = { version = "0.5", features = ["all"] }
+prost = "0.14"
+socket2 = { version = "0.6", features = ["all"] }
 clap = { version = "4", features = ["derive"] }
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
-pbkdf2 = { version = "0.12", features = ["simple"] }
-sha2 = "0.10"
-hmac = "0.12"
+pbkdf2 = { version = "0.13", features = ["hmac"] }
+sha2 = "0.11"
 base64 = "0.22"
-rand = "0.8"
+rand = "0.10"
 flate2 = "1"
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1"
 
 [build-dependencies]
-prost-build = "0.13"
+prost-build = "0.14"
 
 [profile.release]
-opt-level = 3
-lto = true
+opt-level = 3   
+lto = "fat"          
+codegen-units = 1    
+panic = "abort"       

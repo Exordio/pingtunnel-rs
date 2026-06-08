@@ -2,12 +2,12 @@
 //! ChaCha20-Poly1305. Совместимо с Go-версией: к шифртексту впереди
 //! приписывается случайный nonce, ключ выводится из base64 или через PBKDF2.
 
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
+use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
 use anyhow::{anyhow, bail, Result};
 use base64::Engine;
 use chacha20poly1305::ChaCha20Poly1305;
-use rand::RngCore;
+use rand::Rng;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncryptionMode {
@@ -73,7 +73,7 @@ impl Crypto {
 
     pub fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
         let mut nonce_bytes = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce_bytes);
+        rand::rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = match &self.cipher {
             Cipher::Aes128(c) => c.encrypt(nonce, data),
