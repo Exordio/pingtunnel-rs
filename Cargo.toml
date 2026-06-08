@@ -2,7 +2,7 @@
 name = "pingtunnel"
 version = "1.0.0"
 edition = "2021"
-description = "Туннелирование TCP/UDP/SOCKS5 трафика поверх ICMP (порт esrrhs/pingtunnel на Rust)"
+description = "Туннелирование TCP/UDP/SOCKS5 трафика поверх ICMP."
 license = "MIT"
 
 [[bin]]

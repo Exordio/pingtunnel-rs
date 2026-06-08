@@ -53,14 +53,12 @@ pub fn listen_icmp(addr: &str) -> Result<(Socket, bool)> {
 /// Асинхронный ICMP-сокет, разделяемый между read- и write-тасками.
 pub struct IcmpIo {
     pub fd: AsyncFd<Socket>,
-    pub datagram: bool,
 }
 
 impl IcmpIo {
-    pub fn new(socket: Socket, datagram: bool) -> io::Result<IcmpIo> {
+    pub fn new(socket: Socket) -> io::Result<IcmpIo> {
         Ok(IcmpIo {
             fd: AsyncFd::new(socket)?,
-            datagram,
         })
     }
 }
