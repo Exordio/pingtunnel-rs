@@ -22,7 +22,12 @@ use tokio::sync::mpsc;
 
 const SEND_PROTO: u8 = ICMP_ECHO_REQUEST; // 8
 const RECV_PROTO: i32 = 0;
-const TICK: Duration = Duration::from_millis(1);
+// Тик цикла соединения. Соединение event-driven: на входящих фреймах и локальных
+// данных оно просыпается немедленно (ветки select), а тик нужен лишь для таймеров
+// (resend ~400мс, ping/hb ~1с). Поэтому при наличии работы тикаем мелко, а на
+// простое — крупно, вместо постоянного busy-poll на 1мс.
+const ACTIVE_TICK: Duration = Duration::from_millis(10);
+const IDLE_TICK: Duration = Duration::from_millis(500);
 
 pub struct ClientConfig {
     pub listen: String,
@@ -500,19 +505,17 @@ impl Client {
         fm.connect();
         let (mut rd, mut wr) = stream.into_split();
         let mut rbuf = vec![0u8; 256 * 1024];
-        let mut ticker = tokio::time::interval(TICK);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let start = Instant::now();
         let timeout_dur = Duration::from_secs(self.cfg.timeout.max(1) as u64);
         let mut last_recv = Instant::now();
-        let mut last_send = Instant::now();
         let mut local_eof = false;
         let mut close_since: Option<Instant> = None;
         let server_ip = self.server_ip();
 
         loop {
             let connected = fm.is_connected();
+            let tick = if fm.has_pending_work() { ACTIVE_TICK } else { IDLE_TICK };
             tokio::select! {
                 m = crx.recv() => {
                     match m {
@@ -532,18 +535,17 @@ impl Client {
                 r = rd.read(&mut rbuf), if connected && !local_eof && fm.get_send_buffer_left() > 0 => {
                     match r {
                         Ok(0) => { local_eof = true; fm.close(); }
-                        Ok(n) => { fm.write_send_buffer(&rbuf[..n]); last_send = Instant::now(); }
+                        Ok(n) => { fm.write_send_buffer(&rbuf[..n]); }
                         Err(_) => { local_eof = true; fm.close(); }
                     }
                 }
-                _ = ticker.tick() => {}
+                _ = tokio::time::sleep(tick) => {}
             }
 
             fm.update();
 
             let list = fm.take_send_list();
             if !list.is_empty() {
-                last_send = Instant::now();
                 let with_params = !connected;
                 for f in &list {
                     let bytes = self.frame_packet(id, f, &target, with_params);
@@ -575,7 +577,11 @@ impl Client {
             if fm.is_remote_closed() {
                 break;
             }
-            if last_recv.elapsed() > timeout_dur && last_send.elapsed() > timeout_dur {
+            // Таймаут по «тишине от пира»: живой пир шлёт ping/hb каждую секунду,
+            // поэтому last_recv обновляется. Нельзя завязываться на last_send —
+            // мы сами шлём ping/hb постоянно, и условие никогда бы не срабатывало
+            // (это и приводило к утечке зомби-соединений и росту счётчиков).
+            if last_recv.elapsed() > timeout_dur {
                 break;
             }
             if local_eof {

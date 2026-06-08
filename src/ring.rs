@@ -258,19 +258,27 @@ impl ROBuffer {
         if self.begin >= self.flag.len() || !self.flag[self.begin] {
             return;
         }
-        let start = self.begin;
+        // Обходим только занятые слоты: их ровно `size`, поэтому останавливаемся,
+        // как только перебрали все, не сканируя пустой хвост кольца (windowsize
+        // может быть 2048, а кадров в полёте — единицы).
+        let total = self.size;
+        let mut seen = 0usize;
         let mut index = self.begin;
         loop {
             if self.flag[index] {
                 if let Some(frame) = self.buffer[index].as_mut() {
                     f(frame);
                 }
+                seen += 1;
+                if seen >= total {
+                    break;
+                }
             }
             index += 1;
             if index >= self.len {
-                index %= self.len;
+                index = 0;
             }
-            if index == start {
+            if index == self.begin {
                 break;
             }
         }
@@ -284,23 +292,29 @@ impl ROBuffer {
 
     /// Перечисляет id занятых слотов начиная с фронта (для построения REQ по дыркам).
     pub fn occupied_ids_from_front(&self) -> Vec<i64> {
-        let mut out = Vec::new();
         if self.begin >= self.flag.len() || !self.flag[self.begin] {
-            return out;
+            return Vec::new();
         }
-        let start = self.begin;
+        // Как и for_each_from_front — перебираем ровно `size` занятых слотов.
+        let total = self.size;
+        let mut out = Vec::with_capacity(total);
+        let mut seen = 0usize;
         let mut index = self.begin;
         loop {
             if self.flag[index] {
                 if let Some(frame) = self.buffer[index].as_ref() {
                     out.push(frame.id as i64);
                 }
+                seen += 1;
+                if seen >= total {
+                    break;
+                }
             }
             index += 1;
             if index >= self.len {
-                index %= self.len;
+                index = 0;
             }
-            if index == start {
+            if index == self.begin {
                 break;
             }
         }

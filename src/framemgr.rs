@@ -164,9 +164,21 @@ impl FrameMgr {
         let active = self.process_recv_list();
         self.combine_window_to_recv_buffer(cur);
         self.cal_send_list(cur);
-        self.ping();
-        self.hb();
+        self.ping(cur);
+        self.hb(cur);
         active
+    }
+
+    /// Есть ли незавершённая работа: кадры в полёте (ждут ACK), данные в буферах
+    /// отправки/приёма или дырки в окне приёма. Цикл соединения использует это,
+    /// чтобы выбрать частоту тика: мелкий тик при работе, крупный — на простое
+    /// (соединение всё равно просыпается на входящих фреймах/локальных данных
+    /// немедленно, тик нужен лишь для таймеров resend/ping/hb).
+    pub fn has_pending_work(&self) -> bool {
+        self.sendwin.size() > 0
+            || self.recvwin.size() > 0
+            || self.sendb.size() > 0
+            || self.recvb.size() > 0
     }
 
     // ── Отправка ───────────────────────────────────────────────────────
@@ -261,8 +273,7 @@ impl FrameMgr {
         });
     }
 
-    fn ping(&mut self) {
-        let cur = now_ns();
+    fn ping(&mut self, cur: i64) {
         if cur - self.last_ping_time > SECOND {
             self.last_ping_time = cur;
             self.sendlist.push(Frame {
@@ -277,8 +288,7 @@ impl FrameMgr {
         }
     }
 
-    fn hb(&mut self) {
-        let cur = now_ns();
+    fn hb(&mut self, cur: i64) {
         if cur - self.last_send_hb_time > SECOND && self.sendwin.size() < self.windowsize as usize {
             self.last_send_hb_time = cur;
             let f = self.make_data_frame(FD_HB, Vec::new(), false);
@@ -298,6 +308,12 @@ impl FrameMgr {
     /// Разбирает recvlist на REQ/ACK/DATA/PING/PONG и обрабатывает их.
     /// Возвращает true, если была какая-либо активность.
     fn process_recv_list(&mut self) -> bool {
+        // Нет входящих фреймов — на простое не аллоцируем временные коллекции.
+        // ACKed-фронт уже выгребается до конца в каждом вызове, так что без
+        // новых фреймов делать нечего.
+        if self.recvlist.is_empty() {
+            return false;
+        }
         let recvlist = std::mem::take(&mut self.recvlist);
         let mut tmpreq: Vec<i64> = Vec::new();
         let mut tmpack: Vec<i64> = Vec::new();
@@ -391,6 +407,11 @@ impl FrameMgr {
     }
 
     fn combine_window_to_recv_buffer(&mut self, cur: i64) {
+        // Окно приёма пусто — нечего собирать и не из чего строить REQ; на
+        // простое не аллоцируем occupied/reqtmp.
+        if self.recvwin.size() == 0 {
+            return;
+        }
         loop {
             let mut done = false;
             if let Some(fid) = self.recvwin.front_id() {

@@ -21,7 +21,10 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-const TICK: Duration = Duration::from_millis(1);
+// См. client.rs: мелкий тик при наличии работы, крупный на простое; соединение
+// event-driven, busy-poll на 1мс не нужен.
+const ACTIVE_TICK: Duration = Duration::from_millis(10);
+const IDLE_TICK: Duration = Duration::from_millis(500);
 
 pub struct ServerConfig {
     pub icmp_listen: String,
@@ -405,16 +408,14 @@ impl Server {
         );
         let (mut rd, mut wr) = stream.into_split();
         let mut rbuf = vec![0u8; 256 * 1024];
-        let mut ticker = tokio::time::interval(TICK);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let timeout_dur = Duration::from_secs(params.timeout as u64);
         let mut last_recv = Instant::now();
-        let mut last_send = Instant::now();
         let mut local_eof = false;
         let mut close_since: Option<Instant> = None;
 
         loop {
             let connected = fm.is_connected();
+            let tick = if fm.has_pending_work() { ACTIVE_TICK } else { IDLE_TICK };
             tokio::select! {
                 m = rx.recv() => {
                     match m {
@@ -438,18 +439,17 @@ impl Server {
                 r = rd.read(&mut rbuf), if connected && !local_eof && fm.get_send_buffer_left() > 0 => {
                     match r {
                         Ok(0) => { local_eof = true; fm.close(); }
-                        Ok(n) => { fm.write_send_buffer(&rbuf[..n]); last_send = Instant::now(); }
+                        Ok(n) => { fm.write_send_buffer(&rbuf[..n]); }
                         Err(_) => { local_eof = true; fm.close(); }
                     }
                 }
-                _ = ticker.tick() => {}
+                _ = tokio::time::sleep(tick) => {}
             }
 
             fm.update();
 
             let list = fm.take_send_list();
             if !list.is_empty() {
-                last_send = Instant::now();
                 for f in &list {
                     let my = MyMsg {
                         id: id.clone(),
@@ -483,7 +483,10 @@ impl Server {
             if fm.is_remote_closed() {
                 break;
             }
-            if last_recv.elapsed() > timeout_dur && last_send.elapsed() > timeout_dur {
+            // Таймаут по тишине от пира (см. client.rs): завязка на last_send
+            // ломала закрытие, т.к. сервер сам шлёт ping/hb каждую секунду —
+            // соединения-зомби копились, а счётчики только росли.
+            if last_recv.elapsed() > timeout_dur {
                 break;
             }
             if local_eof {
