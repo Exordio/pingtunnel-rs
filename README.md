@@ -86,8 +86,13 @@ Since ICMP is an unreliable channel with no delivery or ordering guarantees, for
 - ping/pong for RTT estimation and heartbeat for liveness control;
 - optional frame compression (zlib).
 
-For **UDP** the reliable layer is not used — datagrams are passed as-is
-(unreliably, just like UDP itself).
+For **UDP** the reliable layer is off by default — datagrams are passed as-is
+(unreliably, just like UDP itself). Pass `--udp_rel 1` (client side) to route
+datagrams through the **same** `FrameMgr` as TCP: retransmission and ordering are
+applied, while datagram boundaries are preserved via a length prefix. Useful when
+the ICMP path loses a lot of packets. Works for both plain UDP forwarding (`-t`)
+and **SOCKS5 UDP ASSOCIATE** (`--sock5 1`). Only the client needs the flag — the
+server detects a reliable-UDP connection from the connect packet.
 
 ## Building
 
@@ -170,6 +175,12 @@ All traffic to local port `4455` is forwarded to `SERVER:4455`:
 > Here `SERVER` is the public IP or domain of the machine running the server,
 > and `-t` is the destination address the server will forward traffic to.
 
+Reliable UDP (retransmission + ordering over a lossy ICMP path):
+
+```bash
+./pingtunnel --type client -l :4455 -s SERVER -t SERVER:4455 --udp_rel 1 --key 123456
+```
+
 ## Encryption
 
 The ICMP payload can be encrypted with an AEAD cipher. Supported: `aes128`,
@@ -213,6 +224,7 @@ UDP forwarding via a proxy is supported only for `socks5` (UDP ASSOCIATE).
 | `--encrypt`     | encryption mode: `aes128`/`aes256`/`chacha20`                     | (off)                    |
 | `--encrypt-key` | encryption key (base64 or passphrase)                             | —                        |
 | `--tcp`         | enable TCP mode (`1`)                                             | `0`                      |
+| `--udp_rel`     | reliable UDP via FrameMgr (`1`; UDP forward & SOCKS5 UDP)         | `0`                      |
 | `--tcp_bs`      | TCP buffer size (per connection, each direction)                  | `262144`                 |
 | `--tcp_mw`      | maximum window (frames in flight)                                 | `2048`                   |
 | `--tcp_rst`     | TCP retransmission time, ms                                       | `400`                    |
@@ -308,7 +320,8 @@ timer), with no busy-poll. A single read task receives ICMP in batches
 (`recvmmsg`) and demultiplexes by conn-id; a single write task collects outgoing
 data and sends it in a batch (`sendmmsg`). For **TCP** each connection holds a
 `FrameMgr` (reliable delivery, sole owner without a `Mutex`); for **UDP** —
-direct datagram forwarding without a reliable layer (as in the original). Memory
+direct datagram forwarding without a reliable layer (as in the original), or
+through `FrameMgr` with `--udp_rel 1` (plain UDP and SOCKS5 UDP ASSOCIATE). Memory
 ~20–150 MB (depends on the number of connections).
 
 Supported: **TCP forwarding**, **SOCKS5 CONNECT** (TCP), **plain UDP forwarding**

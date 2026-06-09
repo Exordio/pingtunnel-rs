@@ -23,4 +23,7 @@ message MyMsg {
   int32 tcpmode_resend_timems = 12;
   int32 tcpmode_compress = 13;
   int32 tcpmode_stat = 14;
+  // 1 = надёжное UDP-соединение: транспорт идёт через FrameMgr (как у TCP),
+  // но цель на сервере открывается как UDP. Используется вместе с tcpmode=1.
+  int32 udp = 15;
 }
