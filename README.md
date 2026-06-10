@@ -65,6 +65,7 @@ realities.)**
   - [Client: UDP forwarding](#client-udp-forwarding)
 - [Encryption](#encryption)
 - [Forwarding via a proxy](#forwarding-via-a-proxy)
+- [Experimental: custom IP protocol](#experimental-custom-ip-protocol)
 - [All command-line options](#all-command-line-options)
 - [Implementation architecture](#implementation-architecture)
 - [Tests](#tests)
@@ -86,8 +87,13 @@ Since ICMP is an unreliable channel with no delivery or ordering guarantees, for
 - ping/pong for RTT estimation and heartbeat for liveness control;
 - optional frame compression (zlib).
 
-For **UDP** the reliable layer is not used — datagrams are passed as-is
-(unreliably, just like UDP itself).
+For **UDP** the reliable layer is off by default — datagrams are passed as-is
+(unreliably, just like UDP itself). Pass `--udp_rel 1` (client side) to route
+datagrams through the **same** `FrameMgr` as TCP: retransmission and ordering are
+applied, while datagram boundaries are preserved via a length prefix. Useful when
+the ICMP path loses a lot of packets. Works for both plain UDP forwarding (`-t`)
+and **SOCKS5 UDP ASSOCIATE** (`--sock5 1`). Only the client needs the flag — the
+server detects a reliable-UDP connection from the connect packet.
 
 ## Building
 
@@ -170,6 +176,12 @@ All traffic to local port `4455` is forwarded to `SERVER:4455`:
 > Here `SERVER` is the public IP or domain of the machine running the server,
 > and `-t` is the destination address the server will forward traffic to.
 
+Reliable UDP (retransmission + ordering over a lossy ICMP path):
+
+```bash
+./pingtunnel --type client -l :4455 -s SERVER -t SERVER:4455 --udp_rel 1 --key 123456
+```
+
 ## Encryption
 
 The ICMP payload can be encrypted with an AEAD cipher. Supported: `aes128`,
@@ -199,6 +211,50 @@ sudo ./pingtunnel --type server --key 123456 --forward http://localhost:8080
 
 UDP forwarding via a proxy is supported only for `socks5` (UDP ASSOCIATE).
 
+## Experimental: custom IP protocol
+
+> ⚠️ **Experimental mode. Not a robust solution - see the limitations below.**
+
+By default the transport runs over ICMP (IP protocol 1). The `--ip_proto N` flag
+allows the same wire format to be used over a different IP protocol number -
+for example `253` or `254`, reserved by IANA for experimentation (RFC 3692).
+The packet format is unchanged (the same 8-byte pseudo-echo header and protobuf);
+only the `protocol` field of the IP header changes, and it is built by the kernel.
+
+Purpose: on some networks ICMP throughput is limited at the traffic-class level
+(DPI or a shaper targeting ICMP). Using a different IP protocol allows this
+ICMP-specific limiting to be avoided. A throughput of about 150-160 Mbit/s was
+measured with `--jumbo 1400` on a link where ICMP throughput was significantly
+limited.
+
+Limitations:
+- The protocol number must match on the client and the server.
+- A RAW socket is required on both ends (root or `CAP_NET_RAW`); the unprivileged
+  datagram mode is not available (unlike ICMP).
+- The mode is incompatible with NAT: translation is performed only for TCP, UDP
+  and ICMP, so a custom protocol has no return path through a stateful NAT.
+  Operation is possible only with direct routing, or through equipment that
+  forwards unknown protocols unchanged.
+- The protocol is easily blocked: unlike ICMP there is no accompanying legitimate
+  traffic, so it can be dropped entirely once detected.
+- There is no masquerading as ICMP echo.
+
+```bash
+# server
+sudo ./pingtunnel --type server --key 123456 --ip_proto 253
+
+# client
+./pingtunnel --type client -l :1080 -s SERVER --sock5 1 --key 123456 --ip_proto 253
+```
+
+Verifying that the protocol traverses the path (run on the server during transfer):
+
+```bash
+tcpdump -ni any 'ip proto 253'
+```
+
+To return to standard ICMP, omit the flag (or set it to `1`).
+
 ## All command-line options
 
 | Option          | Purpose                                                            | Default                  |
@@ -213,6 +269,7 @@ UDP forwarding via a proxy is supported only for `socks5` (UDP ASSOCIATE).
 | `--encrypt`     | encryption mode: `aes128`/`aes256`/`chacha20`                     | (off)                    |
 | `--encrypt-key` | encryption key (base64 or passphrase)                             | —                        |
 | `--tcp`         | enable TCP mode (`1`)                                             | `0`                      |
+| `--udp_rel`     | reliable UDP via FrameMgr (`1`; UDP forward & SOCKS5 UDP)         | `0`                      |
 | `--tcp_bs`      | TCP buffer size (per connection, each direction)                  | `262144`                 |
 | `--tcp_mw`      | maximum window (frames in flight)                                 | `2048`                   |
 | `--tcp_rst`     | TCP retransmission time, ms                                       | `400`                    |
@@ -224,6 +281,7 @@ UDP forwarding via a proxy is supported only for `socks5` (UDP ASSOCIATE).
 | `--maxconn`     | maximum connections (0 — unlimited)                              | `0`                      |
 | `--conntt`      | server-to-target connect timeout, ms                             | `1000`                   |
 | `--forward`     | forwarding via a proxy (`socks5://…` / `http://…`)                | (off)                    |
+| `--ip_proto`    | transport IP protocol number (1 = ICMP; other = **experimental**, e.g. 253) | `1`            |
 | `--loglevel`    | log level (`debug`/`info`/`warn`/`error`)                        | `info`                   |
 | `--noprint`     | do not print output (`1`)                                        | `0`                      |
 | `--s5filter`    | SOCKS5 GeoIP filter — **not supported** (see differences)         | (off)                    |
@@ -308,7 +366,8 @@ timer), with no busy-poll. A single read task receives ICMP in batches
 (`recvmmsg`) and demultiplexes by conn-id; a single write task collects outgoing
 data and sends it in a batch (`sendmmsg`). For **TCP** each connection holds a
 `FrameMgr` (reliable delivery, sole owner without a `Mutex`); for **UDP** —
-direct datagram forwarding without a reliable layer (as in the original). Memory
+direct datagram forwarding without a reliable layer (as in the original), or
+through `FrameMgr` with `--udp_rel 1` (plain UDP and SOCKS5 UDP ASSOCIATE). Memory
 ~20–150 MB (depends on the number of connections).
 
 Supported: **TCP forwarding**, **SOCKS5 CONNECT** (TCP), **plain UDP forwarding**

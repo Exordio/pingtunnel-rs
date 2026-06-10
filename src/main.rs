@@ -10,6 +10,7 @@ mod proto;
 mod ring;
 mod server;
 mod socks5;
+mod udprel;
 mod util;
 
 use clap::Parser;
@@ -43,6 +44,12 @@ struct Args {
     encrypt_key: String,
     #[arg(long = "tcp", default_value_t = 0)]
     tcp: i32,
+    /// Надёжный UDP: датаграммы идут через FrameMgr (ретрансмиссия + порядок),
+    /// как у TCP. Иначе UDP шлётся без подтверждений и теряется при потерях в
+    /// ICMP-канале. 1 = включить. Работает для UDP-проброса (-t) и SOCKS5 UDP
+    /// ASSOCIATE (-sock5 1); в чистом TCP-форварде смысла не имеет.
+    #[arg(long = "udp_rel", default_value_t = 0)]
+    udp_rel: i32,
     /// Размер буфера TCP (на соединение, в каждую сторону)
     #[arg(long = "tcp_bs", default_value_t = 256 * 1024)]
     tcp_bs: i32,
@@ -74,6 +81,14 @@ struct Args {
     conntt: i32,
     #[arg(long = "forward", default_value = "")]
     forward: String,
+    /// Номер IP-протокола транспорта. 1 = ICMP (по умолчанию). Любой другой
+    /// (напр. 253/254 - зарезервированы RFC 3692 под эксперименты) гонит трафик
+    /// поверх кастомного IP-протокола вместо ICMP. Нужен RAW-сокет (root/CAP_NET_RAW)
+    /// на обоих концах, datagram-фоллбэка нет. ВНИМАНИЕ: не переживает NAT и
+    /// режется большинством файрволов - работает лишь при прямой маршрутизации
+    /// без NAT по пути. Значение должно совпадать на клиенте и сервере.
+    #[arg(long = "ip_proto", default_value_t = 1)]
+    ip_proto: u8,
 }
 
 fn normalize_args() -> Vec<String> {
@@ -174,6 +189,7 @@ async fn run_server(args: Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
         maxconn: args.maxconn,
         connect_timeout: args.conntt,
         frame_size: frame_size(args.jumbo),
+        ip_proto: args.ip_proto,
     };
     let srv = server::Server::new(cfg, crypto, forward)?;
     srv.run().await
@@ -190,6 +206,14 @@ async fn run_client(args: Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
     // tcp==0 без sock5 = режим чистого UDP-проброса (нужен -t).
     if args.sock5 == 0 && args.target.is_empty() {
         anyhow::bail!("client requires -t (target) for UDP/TCP forward, or -sock5 1");
+    }
+    // Надёжный UDP применим к UDP-путям: чистому UDP-пробросу и SOCKS5 UDP
+    // ASSOCIATE. В чистом TCP-форварде (-tcp 1 без -sock5) UDP нет — там флаг
+    // не имеет смысла. На TCP-часть SOCKS5 (CONNECT) флаг не влияет.
+    let plain_udp = tcp == 0 && args.sock5 == 0;
+    let udp_reliable = args.udp_rel != 0 && (plain_udp || args.sock5 != 0);
+    if args.udp_rel != 0 && !udp_reliable {
+        log::warn!("--udp_rel игнорируется: в чистом TCP-форварде UDP нет (нужен UDP-проброс или -sock5)");
     }
     if args.tcp_mw * 10 > proto::FRAME_MAX_ID {
         anyhow::bail!("tcp win too big, max = {}", proto::FRAME_MAX_ID / 10);
@@ -211,6 +235,8 @@ async fn run_client(args: Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
         sock5: args.sock5,
         s5user: args.s5user.clone(),
         s5pass: args.s5pass.clone(),
+        udp_reliable,
+        ip_proto: args.ip_proto,
     };
     let cli = client::Client::new(cfg, crypto)?;
     cli.run().await
