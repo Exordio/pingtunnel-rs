@@ -10,7 +10,7 @@ use crate::proto::*;
 use crate::socks5;
 use crate::stats::{ConnInfo, ConnKind, Stats};
 use crate::udprel;
-use crate::util::{now_ns, resolve_ipv4, unique_id};
+use crate::util::{now_ns, resolve_ipv4, trim_memory, unique_id};
 use anyhow::Result;
 use prost::Message as _;
 use std::collections::HashMap;
@@ -811,6 +811,7 @@ impl Client {
 
     async fn maintenance(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut since_trim = 0u32;
         loop {
             tick.tick().await;
             // Закрываем неактивные простые UDP-соединения (надёжные закрываются
@@ -839,6 +840,13 @@ impl Client {
                     log::info!("server ip refreshed {} -> {}", *cur, ip);
                     *cur = ip;
                 }
+            }
+            // Раз в минуту возвращаем ОС память, освобождённую закрытыми
+            // соединениями (glibc сам её не отдаёт - см. [`trim_memory`]).
+            since_trim += 1;
+            if since_trim >= 60 {
+                since_trim = 0;
+                trim_memory();
             }
         }
     }

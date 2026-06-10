@@ -19,6 +19,20 @@ pub fn unique_id() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Возвращает ОС свободную память кучи. Надёжные соединения держат крупные
+/// буферы (RBuffer по `tcp_bs` в каждую сторону + окна фреймов); при пике из
+/// сотен соединений RSS вырастает до сотен МБ. После их закрытия буферы
+/// освобождаются, но glibc malloc держит освобождённые страницы в своих аренах
+/// (по одной на worker-поток) и не отдаёт их ядру сам - RSS застывает на
+/// high-water mark. `malloc_trim(0)` обходит все арены и возвращает свободные
+/// страницы ОС. Вызывается периодически из maintenance. Вне glibc - no-op.
+pub fn trim_memory() {
+    #[cfg(target_env = "gnu")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// Резолвит host (или host:port-подобную строку без порта) в первый IPv4-адрес.
 pub fn resolve_ipv4(host: &str) -> Result<Ipv4Addr> {
     if let Ok(ip) = host.parse::<Ipv4Addr>() {

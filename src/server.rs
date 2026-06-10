@@ -11,7 +11,7 @@ use crate::icmp::{self, encode_packet, IcmpIo, OutPkt, RecvBatch, RecvMode, Wire
 use crate::proto::*;
 use crate::stats::{ConnInfo, ConnKind, Stats};
 use crate::udprel;
-use crate::util::now_ns;
+use crate::util::{now_ns, trim_memory};
 use anyhow::Result;
 use prost::Message as _;
 use std::collections::HashMap;
@@ -647,6 +647,7 @@ impl Server {
 
     async fn maintenance(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut since_trim = 0u32;
         loop {
             tick.tick().await;
             self.conn_error
@@ -658,6 +659,13 @@ impl Server {
             log::info!(
                 "send {send_pkts}Packet/s {send_kb}KB/s recv {recv_pkts}Packet/s {recv_kb}KB/s {conns}Connections"
             );
+            // Раз в минуту возвращаем ОС память, освобождённую закрытыми
+            // соединениями (glibc сам её не отдаёт - см. [`trim_memory`]).
+            since_trim += 1;
+            if since_trim >= 60 {
+                since_trim = 0;
+                trim_memory();
+            }
         }
     }
 }
