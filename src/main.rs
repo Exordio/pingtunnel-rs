@@ -10,11 +10,16 @@ mod proto;
 mod ring;
 mod server;
 mod socks5;
+mod stats;
+mod tui;
 mod udprel;
 mod util;
 
 use clap::Parser;
 use crypto::{Crypto, EncryptionMode};
+use stats::Stats;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -98,6 +103,25 @@ struct Args {
     /// DPI. Пусто = выключено.
     #[arg(long = "ip_proto_range", default_value = "")]
     ip_proto_range: String,
+    /// Интерактивный TUI: графики скорости TX/RX и список активных соединений
+    /// (тип, цель, IP-протокол транспорта, объём трафика). Туннель при этом
+    /// работает в обычном режиме; логирование в stdout отключается, чтобы не
+    /// портить интерфейс. Выход - q/Esc/Ctrl-C.
+    #[arg(long = "interactive", default_value_t = false)]
+    interactive: bool,
+}
+
+/// Краткое описание набора IP-протоколов транспорта для заголовка TUI.
+fn protos_desc(protos: &[u8]) -> String {
+    match protos {
+        [] => "ICMP".to_string(),
+        [p] => stats::proto_name(*p),
+        _ => {
+            let lo = protos.iter().min().copied().unwrap_or(1);
+            let hi = protos.iter().max().copied().unwrap_or(1);
+            format!("ротация [{lo}..{hi}]")
+        }
+    }
 }
 
 /// Строит список IP-протоколов транспорта: либо диапазон `--ip_proto_range`
@@ -145,7 +169,8 @@ fn normalize_args() -> Vec<String> {
 fn main() {
     let args = Args::parse_from(normalize_args());
 
-    let level = if args.noprint > 0 {
+    // В TUI логи в stdout/stderr изуродовали бы интерфейс - глушим их.
+    let level = if args.interactive || args.noprint > 0 {
         "off"
     } else {
         match args.loglevel.as_str() {
@@ -183,6 +208,8 @@ fn main() {
 
     log::info!("start... key {}", args.key);
 
+    let stats = Arc::new(Stats::default());
+
     let workers = num_cpus::get().max(1);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
@@ -190,16 +217,71 @@ fn main() {
         .build()
         .expect("build tokio runtime");
 
+    if args.interactive {
+        run_interactive(rt, args, crypto, stats);
+        return;
+    }
+
     let result = rt.block_on(async move {
         if args.r#type == "server" {
-            run_server(args, crypto).await
+            run_server(args, crypto, stats).await
         } else {
-            run_client(args, crypto).await
+            run_client(args, crypto, stats).await
         }
     });
 
     if let Err(e) = result {
         log::error!("ERROR: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Интерактивный режим: туннель крутится фоновой задачей на runtime, а TUI
+/// блокирует главный поток. Когда туннель завершается (обычно лишь при ошибке),
+/// взводится флаг, по которому TUI выходит и восстанавливает терминал.
+fn run_interactive(
+    rt: tokio::runtime::Runtime,
+    args: Args,
+    crypto: Option<Crypto>,
+    stats: Arc<Stats>,
+) {
+    let is_server = args.r#type == "server";
+    let protos = build_ip_protos(args.ip_proto, &args.ip_proto_range).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
+    let meta = tui::Meta {
+        mode: args.r#type.clone(),
+        listen: if is_server { args.icmp_listen.clone() } else { args.listen.clone() },
+        server: if is_server { String::new() } else { args.server.clone() },
+        protos: protos_desc(&protos),
+    };
+
+    let done = Arc::new(AtomicBool::new(false));
+    let err_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    let done_bg = done.clone();
+    let err_bg = err_slot.clone();
+    let stats_bg = stats.clone();
+    rt.spawn(async move {
+        let r = if is_server {
+            run_server(args, crypto, stats_bg).await
+        } else {
+            run_client(args, crypto, stats_bg).await
+        };
+        if let Err(e) = r {
+            *err_bg.lock().unwrap() = Some(format!("{e}"));
+        }
+        done_bg.store(true, Ordering::SeqCst);
+    });
+
+    let res = tui::run(stats, meta, done);
+    // Терминал восстановлен (TermGuard в tui::run). Теперь можно печатать ошибки.
+    if let Err(e) = res {
+        eprintln!("tui error: {e}");
+    }
+    if let Some(e) = err_slot.lock().unwrap().take() {
+        eprintln!("ERROR: {e}");
         std::process::exit(1);
     }
 }
@@ -212,7 +294,7 @@ fn frame_size(jumbo: usize) -> usize {
     }
 }
 
-async fn run_server(args: Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
+async fn run_server(args: Args, crypto: Option<Crypto>, stats: Arc<Stats>) -> anyhow::Result<()> {
     let forward = forward::parse_forward_url(&args.forward)?;
     if forward.is_some() {
         log::info!("Forward proxy configured: {}", args.forward);
@@ -225,11 +307,11 @@ async fn run_server(args: Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
         frame_size: frame_size(args.jumbo),
         ip_protos: build_ip_protos(args.ip_proto, &args.ip_proto_range)?,
     };
-    let srv = server::Server::new(cfg, crypto, forward)?;
+    let srv = server::Server::new(cfg, crypto, forward, stats)?;
     srv.run().await
 }
 
-async fn run_client(args: Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
+async fn run_client(args: Args, crypto: Option<Crypto>, stats: Arc<Stats>) -> anyhow::Result<()> {
     if args.listen.is_empty() || args.server.is_empty() {
         anyhow::bail!("client requires -l and -s");
     }
@@ -272,6 +354,6 @@ async fn run_client(args: Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
         udp_reliable,
         ip_protos: build_ip_protos(args.ip_proto, &args.ip_proto_range)?,
     };
-    let cli = client::Client::new(cfg, crypto)?;
+    let cli = client::Client::new(cfg, crypto, stats)?;
     cli.run().await
 }

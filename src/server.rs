@@ -9,8 +9,9 @@ use crate::forward::{self, ForwardConfig};
 use crate::framemgr::{marshal_frame, FrameMgr};
 use crate::icmp::{self, encode_packet, IcmpIo, OutPkt, RecvBatch, RecvMode};
 use crate::proto::*;
+use crate::stats::{ConnInfo, ConnKind, Stats};
 use crate::udprel;
-use crate::util::{now_ns, Counters};
+use crate::util::now_ns;
 use anyhow::Result;
 use prost::Message as _;
 use std::collections::HashMap;
@@ -90,6 +91,7 @@ struct UdpFlow {
     echo_seq: AtomicU16,
     src: AtomicU32, // ip клиента (биты), куда слать ICMP-ответ
     last: AtomicI64,
+    info: Arc<ConnInfo>, // запись в реестре статистики (per-conn байты)
 }
 
 pub struct Server {
@@ -106,7 +108,7 @@ pub struct Server {
     // Простые UDP-соединения (прямой проброс): conn-id → соединение.
     udp_conns: Mutex<HashMap<String, Arc<UdpFlow>>>,
     conn_error: Mutex<HashMap<String, Instant>>,
-    counters: Counters,
+    counters: Arc<Stats>,
 }
 
 impl Server {
@@ -114,6 +116,7 @@ impl Server {
         cfg: ServerConfig,
         crypto: Option<Crypto>,
         forward: Option<ForwardConfig>,
+        stats: Arc<Stats>,
     ) -> Result<Arc<Server>> {
         let t = icmp::listen_transport(&cfg.icmp_listen, &cfg.ip_protos)?;
         let datagram = t.recv_mode == RecvMode::InetDatagram;
@@ -134,7 +137,7 @@ impl Server {
             conns: Mutex::new(HashMap::new()),
             udp_conns: Mutex::new(HashMap::new()),
             conn_error: Mutex::new(HashMap::new()),
-            counters: Counters::default(),
+            counters: stats,
         }))
     }
 
@@ -207,7 +210,9 @@ impl Server {
                                     if let Some(conn_tx) = conn_tx {
                                         let _ = conn_tx.try_send(Incoming::Kick);
                                     }
-                                    self.udp_conns.lock().unwrap().remove(&msg.id);
+                                    if self.udp_conns.lock().unwrap().remove(&msg.id).is_some() {
+                                        self.counters.unregister(&msg.id);
+                                    }
                                 }
                                 _ => {
                                     if msg.tcpmode == 0 {
@@ -220,6 +225,7 @@ impl Server {
                                                 flow.src.store(u32::from(src), Ordering::Relaxed);
                                                 flow.last.store(now_ns(), Ordering::Relaxed);
                                                 self.counters.add_recv(msg.data.len());
+                                                flow.info.add_recv(msg.data.len());
                                                 let _ = flow.to_target.try_send(msg.data);
                                             }
                                             None => self.create_udp_conn(msg, reply),
@@ -285,6 +291,8 @@ impl Server {
             rproto: msg.rproto,
             udp: msg.udp != 0,
         };
+        let kind = if params.udp { ConnKind::UdpReliable } else { ConnKind::Tcp };
+        let info = self.counters.register(id.clone(), kind, addr.clone(), reply.proto);
         let (conn_tx, conn_rx) = mpsc::channel::<Incoming>(2048);
         let _ = conn_tx.try_send(Incoming::Data {
             frames: vec![msg.data],
@@ -293,7 +301,7 @@ impl Server {
         // Регистрируем ДО spawn, чтобы следующие пакеты для этого id нашли канал.
         self.conns.lock().unwrap().insert(id.clone(), conn_tx);
         let me = self.clone();
-        tokio::spawn(me.server_conn(id, addr, params, reply, conn_rx));
+        tokio::spawn(me.server_conn(id, addr, params, reply, conn_rx, info));
     }
 
     /// Создаёт серверное простое UDP-соединение к цели (без FrameMgr).
@@ -308,6 +316,9 @@ impl Server {
             self.remote_error(reply, &id, msg.rproto);
             return;
         }
+        let info = self
+            .counters
+            .register(id.clone(), ConnKind::Udp, addr.clone(), reply.proto);
         let (to_target_tx, to_target_rx) = mpsc::channel::<Vec<u8>>(256);
         let flow = Arc::new(UdpFlow {
             to_target: to_target_tx,
@@ -318,9 +329,11 @@ impl Server {
             echo_seq: AtomicU16::new(reply.echo_seq),
             src: AtomicU32::new(u32::from(reply.src)),
             last: AtomicI64::new(now_ns()),
+            info,
         });
         self.udp_conns.lock().unwrap().insert(id.clone(), flow.clone());
         self.counters.add_recv(msg.data.len());
+        flow.info.add_recv(msg.data.len());
         let _ = flow.to_target.try_send(msg.data); // первый датаграм
         let idle_secs = msg.timeout.max(1);
         let me = self.clone();
@@ -343,6 +356,7 @@ impl Server {
                 log::debug!("udp bind failed: {e}");
                 self.remote_error_for(&flow, &id);
                 self.udp_conns.lock().unwrap().remove(&id);
+        self.counters.unregister(&id);
                 return;
             }
         };
@@ -351,6 +365,7 @@ impl Server {
             self.remote_error_for(&flow, &id);
             self.add_conn_error(&addr);
             self.udp_conns.lock().unwrap().remove(&id);
+        self.counters.unregister(&id);
             return;
         }
 
@@ -383,6 +398,7 @@ impl Server {
                                 flow.echo_id.load(Ordering::Relaxed),
                                 flow.echo_seq.load(Ordering::Relaxed), self.crypto.as_ref());
                             self.counters.add_send(n);
+                            flow.info.add_send(n);
                             let dst = Ipv4Addr::from(flow.src.load(Ordering::Relaxed));
                             let _ = self.tx.send((dst, bytes, flow.proto)).await;
                         }
@@ -396,6 +412,7 @@ impl Server {
             }
         }
         self.udp_conns.lock().unwrap().remove(&id);
+        self.counters.unregister(&id);
         log::debug!("close udp conn {id}");
     }
 
@@ -418,6 +435,7 @@ impl Server {
         params: ConnParams,
         reply: ReplyTo,
         rx: mpsc::Receiver<Incoming>,
+        info: Arc<ConnInfo>,
     ) {
         if params.udp {
             // Надёжный UDP: открываем UDP-сокет к цели и оборачиваем его в
@@ -436,11 +454,12 @@ impl Server {
                 self.remote_error(reply, &id, params.rproto);
                 self.add_conn_error(&addr);
                 self.conns.lock().unwrap().remove(&id);
+                self.counters.unregister(&id);
                 return;
             }
             let idle = Duration::from_secs(params.timeout.max(1) as u64);
             let stream = udprel::spawn_server_bridge(sock, idle);
-            self.run_conn(id, addr, params, stream, reply, rx).await;
+            self.run_conn(id, addr, params, stream, reply, rx, info).await;
             return;
         }
 
@@ -461,16 +480,18 @@ impl Server {
                 self.remote_error(reply, &id, params.rproto);
                 self.add_conn_error(&addr);
                 self.conns.lock().unwrap().remove(&id);
+                self.counters.unregister(&id);
                 return;
             }
         };
         let _ = stream.set_nodelay(true);
-        self.run_conn(id, addr, params, stream, reply, rx).await;
+        self.run_conn(id, addr, params, stream, reply, rx, info).await;
     }
 
     /// Цикл FrameMgr-соединения: гоняет данные между потоком цели и клиентом по
     /// событиям. Универсален по транспорту цели (`stream`): TCP-сокет или
     /// UDP-мост для надёжного UDP.
+    #[allow(clippy::too_many_arguments)]
     async fn run_conn<S>(
         self: Arc<Self>,
         id: String,
@@ -479,6 +500,7 @@ impl Server {
         mut stream: S,
         mut reply: ReplyTo,
         mut rx: mpsc::Receiver<Incoming>,
+        info: Arc<ConnInfo>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
@@ -510,13 +532,13 @@ impl Server {
                     match m {
                         Some(Incoming::Data{frames, reply:r}) => {
                             reply = r;
-                            for fr in frames { if let Ok(f)=Frame::decode(&fr[..]) { fm.on_recv_frame(f); } }
+                            for fr in frames { info.add_recv(fr.len()); if let Ok(f)=Frame::decode(&fr[..]) { fm.on_recv_frame(f); } }
                             last_recv = Instant::now();
                             while let Ok(more) = rx.try_recv() {
                                 match more {
                                     Incoming::Data{frames, reply:r} => {
                                         reply = r;
-                                        for fr in frames { if let Ok(f)=Frame::decode(&fr[..]) { fm.on_recv_frame(f); } }
+                                        for fr in frames { info.add_recv(fr.len()); if let Ok(f)=Frame::decode(&fr[..]) { fm.on_recv_frame(f); } }
                                     }
                                     Incoming::Kick => fm.close(),
                                 }
@@ -550,6 +572,7 @@ impl Server {
                     };
                     let bytes = encode_packet(msg, params.rproto as u8, reply.echo_id, reply.echo_seq, self.crypto.as_ref());
                     self.counters.add_send(bytes.len());
+                    info.add_send(bytes.len());
                     let _ = self.tx.send((reply.src, bytes, reply.proto)).await;
                 }
             }
@@ -587,6 +610,7 @@ impl Server {
         }
 
         self.conns.lock().unwrap().remove(&id);
+        self.counters.unregister(&id);
         log::debug!("close conn {id} {addr}");
     }
 

@@ -3,7 +3,6 @@
 use anyhow::{anyhow, Result};
 use rand::Rng;
 use std::net::{Ipv4Addr, ToSocketAddrs};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn now_ns() -> i64 {
@@ -34,32 +33,4 @@ pub fn resolve_ipv4(host: &str) -> Result<Ipv4Addr> {
         }
     }
     Err(anyhow!("no IPv4 address for {host}"))
-}
-
-/// Потокобезопасные счётчики трафика для периодической статистики.
-#[derive(Default)]
-pub struct Counters {
-    pub send_packet: AtomicU64,
-    pub recv_packet: AtomicU64,
-    pub send_size: AtomicU64,
-    pub recv_size: AtomicU64,
-}
-
-impl Counters {
-    pub fn add_send(&self, size: usize) {
-        self.send_packet.fetch_add(1, Ordering::Relaxed);
-        self.send_size.fetch_add(size as u64, Ordering::Relaxed);
-    }
-    pub fn add_recv(&self, size: usize) {
-        self.recv_packet.fetch_add(1, Ordering::Relaxed);
-        self.recv_size.fetch_add(size as u64, Ordering::Relaxed);
-    }
-    /// Возвращает (sendPkt, sendKB, recvPkt, recvKB) и обнуляет счётчики.
-    pub fn take(&self) -> (u64, u64, u64, u64) {
-        let sp = self.send_packet.swap(0, Ordering::Relaxed);
-        let ss = self.send_size.swap(0, Ordering::Relaxed);
-        let rp = self.recv_packet.swap(0, Ordering::Relaxed);
-        let rs = self.recv_size.swap(0, Ordering::Relaxed);
-        (sp, ss / 1024, rp, rs / 1024)
-    }
 }
