@@ -255,6 +255,42 @@ tcpdump -ni any 'ip proto 253'
 
 To return to standard ICMP, omit the flag (or set it to `1`).
 
+### Protocol rotation (`--ip_proto_range`)
+
+Instead of a single fixed protocol, `--ip_proto_range LO-HI` (e.g. `100-254`,
+within `1..=254`) spreads traffic across a range of IP protocol numbers: the
+client picks a random protocol for each connection. This targets per-flow
+classifiers, since each protocol carries only a short-lived subset of traffic.
+
+Because a RAW socket receives exactly one protocol number, reception in this mode
+uses a single `AF_PACKET` socket with an in-kernel BPF filter that accepts only
+incoming packets whose IP protocol is within the range; the server replies on the
+same protocol the request arrived on. Sending uses RAW sockets opened lazily per
+protocol in use, so the kernel still builds the IP header and fragments jumbo
+frames.
+
+The range must match on the client and the server, and root / `CAP_NET_RAW` is
+required on both ends. All limitations of a custom protocol above apply (no NAT
+traversal, easily blocked, no ICMP masquerade); in addition, a host emitting
+traffic across many IP protocols is itself a conspicuous anomaly to DPI - rotation
+helps against per-flow shaping, not against detection.
+
+```bash
+# server
+sudo ./pingtunnel --type server --key 123456 --ip_proto_range 100-254
+
+# client
+./pingtunnel --type client -l :1080 -s SERVER --sock5 1 --key 123456 --ip_proto_range 100-254
+```
+
+Verifying that rotated protocols traverse the path (run on the server during transfer):
+
+```bash
+tcpdump -ni any 'ip[9] >= 100 and ip[9] <= 254'
+```
+
+`--ip_proto_range` overrides `--ip_proto`.
+
 ## All command-line options
 
 | Option          | Purpose                                                            | Default                  |
@@ -282,6 +318,7 @@ To return to standard ICMP, omit the flag (or set it to `1`).
 | `--conntt`      | server-to-target connect timeout, ms                             | `1000`                   |
 | `--forward`     | forwarding via a proxy (`socks5://…` / `http://…`)                | (off)                    |
 | `--ip_proto`    | transport IP protocol number (1 = ICMP; other = **experimental**, e.g. 253) | `1`            |
+| `--ip_proto_range` | **experimental** protocol rotation: range `LO-HI` (e.g. `100-254`); random protocol per connection | (off) |
 | `--loglevel`    | log level (`debug`/`info`/`warn`/`error`)                        | `info`                   |
 | `--noprint`     | do not print output (`1`)                                        | `0`                      |
 | `--s5filter`    | SOCKS5 GeoIP filter — **not supported** (see differences)         | (off)                    |

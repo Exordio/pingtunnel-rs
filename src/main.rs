@@ -89,6 +89,40 @@ struct Args {
     /// без NAT по пути. Значение должно совпадать на клиенте и сервере.
     #[arg(long = "ip_proto", default_value_t = 1)]
     ip_proto: u8,
+    /// Экспериментальная ротация IP-протокола: диапазон `LO-HI` (напр. `100-254`,
+    /// допустимо 1..=254). Если задан, клиент выбирает случайный IP-протокол на
+    /// каждое соединение, приём идёт через один AF_PACKET-сокет с BPF-фильтром по
+    /// диапазону (сервер отвечает тем же протоколом). Перекрывает `--ip_proto`.
+    /// Диапазон должен совпадать на клиенте и сервере; нужен root/CAP_NET_RAW на
+    /// обоих концах. ВНИМАНИЕ: кастомные протоколы не переживают NAT и заметны для
+    /// DPI. Пусто = выключено.
+    #[arg(long = "ip_proto_range", default_value = "")]
+    ip_proto_range: String,
+}
+
+/// Строит список IP-протоколов транспорта: либо диапазон `--ip_proto_range`
+/// (приоритет), либо одиночный `--ip_proto`.
+fn build_ip_protos(single: u8, range: &str) -> anyhow::Result<Vec<u8>> {
+    let range = range.trim();
+    if range.is_empty() {
+        return Ok(vec![single.max(1)]);
+    }
+    let (lo, hi) = range
+        .split_once('-')
+        .ok_or_else(|| anyhow::anyhow!("--ip_proto_range: ожидался формат LO-HI, напр. 100-254"))?;
+    let lo: u16 = lo
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--ip_proto_range: неверный LO"))?;
+    let hi: u16 = hi
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--ip_proto_range: неверный HI"))?;
+    // 255 (IPPROTO_RAW) только на отправку, принимать нельзя; 0 невалиден.
+    if lo < 1 || hi > 254 || lo > hi {
+        anyhow::bail!("--ip_proto_range: допустимо 1..=254 и LO<=HI");
+    }
+    Ok((lo..=hi).map(|p| p as u8).collect())
 }
 
 fn normalize_args() -> Vec<String> {
@@ -189,7 +223,7 @@ async fn run_server(args: Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
         maxconn: args.maxconn,
         connect_timeout: args.conntt,
         frame_size: frame_size(args.jumbo),
-        ip_proto: args.ip_proto,
+        ip_protos: build_ip_protos(args.ip_proto, &args.ip_proto_range)?,
     };
     let srv = server::Server::new(cfg, crypto, forward)?;
     srv.run().await
@@ -236,7 +270,7 @@ async fn run_client(args: Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
         s5user: args.s5user.clone(),
         s5pass: args.s5pass.clone(),
         udp_reliable,
-        ip_proto: args.ip_proto,
+        ip_protos: build_ip_protos(args.ip_proto, &args.ip_proto_range)?,
     };
     let cli = client::Client::new(cfg, crypto)?;
     cli.run().await

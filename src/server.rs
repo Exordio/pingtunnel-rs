@@ -7,7 +7,7 @@
 use crate::crypto::Crypto;
 use crate::forward::{self, ForwardConfig};
 use crate::framemgr::{marshal_frame, FrameMgr};
-use crate::icmp::{self, encode_packet, IcmpIo, OutPkt, RecvBatch};
+use crate::icmp::{self, encode_packet, IcmpIo, OutPkt, RecvBatch, RecvMode};
 use crate::proto::*;
 use crate::udprel;
 use crate::util::{now_ns, Counters};
@@ -34,8 +34,9 @@ pub struct ServerConfig {
     pub maxconn: i32,
     pub connect_timeout: i32,
     pub frame_size: usize,
-    /// Номер IP-протокола транспорта (1 = ICMP по умолчанию; см. [`icmp::listen_icmp`]).
-    pub ip_proto: u8,
+    /// IP-протоколы транспорта. `[1]` = ICMP. Несколько = ротация
+    /// (приём через AF_PACKET, см. [`icmp::listen_transport`]).
+    pub ip_protos: Vec<u8>,
 }
 
 /// Параметры FrameMgr-соединения, объявленные клиентом в connect-пакете.
@@ -51,13 +52,15 @@ struct ConnParams {
     udp: bool,
 }
 
-/// Куда слать ICMP-ответ клиенту: echo id/seq из его запроса (чтобы ответ
-/// «прилетел» как echo-reply на конкретный ping) и IP клиента.
+/// Куда слать ответ клиенту: echo id/seq из его запроса (чтобы ответ «прилетел»
+/// как echo-reply на конкретный ping), IP клиента и IP-протокол, на котором
+/// пришёл пакет (отвечаем тем же - важно в режиме ротации протоколов).
 #[derive(Clone, Copy)]
 struct ReplyTo {
     echo_id: u16,
     echo_seq: u16,
     src: Ipv4Addr,
+    proto: u8,
 }
 
 enum Incoming {
@@ -82,6 +85,7 @@ struct UdpFlow {
     to_target: mpsc::Sender<Vec<u8>>, // данные client→target (задача шлёт через send().await)
     target: String,                   // строка target (в ответном MyMsg.target)
     rproto: i32,                      // sproto для ответа
+    proto: u8,                        // IP-протокол транспорта (ротация): отвечаем тем же
     echo_id: AtomicU16,
     echo_seq: AtomicU16,
     src: AtomicU32, // ip клиента (биты), куда слать ICMP-ответ
@@ -90,7 +94,8 @@ struct UdpFlow {
 
 pub struct Server {
     cfg: ServerConfig,
-    io: Arc<IcmpIo>,
+    rx: Arc<IcmpIo>,
+    recv_mode: RecvMode,
     tx: mpsc::Sender<OutPkt>,
     crypto: Option<Crypto>,
     datagram: bool,
@@ -110,15 +115,18 @@ impl Server {
         crypto: Option<Crypto>,
         forward: Option<ForwardConfig>,
     ) -> Result<Arc<Server>> {
-        let (socket, datagram) = icmp::listen_icmp(&cfg.icmp_listen, cfg.ip_proto)?;
+        let t = icmp::listen_transport(&cfg.icmp_listen, &cfg.ip_protos)?;
+        let datagram = t.recv_mode == RecvMode::InetDatagram;
         if datagram {
             log::warn!("сервер в datagram-режиме: echo request не доставляется, нужен RAW (root)");
         }
-        let io = Arc::new(IcmpIo::new(socket)?);
-        let tx = icmp::spawn_writer(io.clone(), 8192);
+        let recv_mode = t.recv_mode;
+        let rx = t.rx.clone();
+        let tx = icmp::spawn_writer(&t, 8192);
         Ok(Arc::new(Server {
             cfg,
-            io,
+            rx,
+            recv_mode,
             tx,
             crypto,
             datagram,
@@ -147,7 +155,7 @@ impl Server {
         let mut recv_batch = RecvBatch::new(32);
         let mut groups: HashMap<String, BatchedFrames> = HashMap::new();
         loop {
-            let mut guard = match self.io.fd.readable().await {
+            let mut guard = match self.rx.fd.readable().await {
                 Ok(g) => g,
                 Err(_) => break,
             };
@@ -156,7 +164,17 @@ impl Server {
                     Ok(Ok(n)) => {
                         groups.clear();
                         for i in 0..n {
-                            let (raw, src) = recv_batch.get(i);
+                            let (raw, addr_src) = recv_batch.get(i);
+                            // В режиме AF_PACKET адрес recvmmsg - это L2 (sockaddr_ll),
+                            // поэтому src и номер протокола берём из IP-заголовка.
+                            let (src, proto) = if self.recv_mode == RecvMode::Packet {
+                                (
+                                    icmp::src_from_ip(raw).unwrap_or(addr_src),
+                                    icmp::proto_from_ip(raw).unwrap_or(self.rx.proto),
+                                )
+                            } else {
+                                (addr_src, self.rx.proto)
+                            };
                             let (msg, echo_id, echo_seq) =
                                 match icmp::parse_packet(raw, self.datagram, self.crypto.as_ref()) {
                                     Some(v) => v,
@@ -165,7 +183,7 @@ impl Server {
                             if msg.key != self.cfg.key || msg.rproto < 0 {
                                 continue;
                             }
-                            let reply = ReplyTo { echo_id, echo_seq, src };
+                            let reply = ReplyTo { echo_id, echo_seq, src, proto };
                             match msg.r#type {
                                 x if x == MSG_PING => {
                                     let pong = MyMsg {
@@ -182,7 +200,7 @@ impl Server {
                                         echo_seq,
                                         self.crypto.as_ref(),
                                     );
-                                    let _ = self.tx.try_send((src, bytes));
+                                    let _ = self.tx.try_send((src, bytes, proto));
                                 }
                                 x if x == MSG_KICK => {
                                     let conn_tx = self.conns.lock().unwrap().get(&msg.id).cloned();
@@ -295,6 +313,7 @@ impl Server {
             to_target: to_target_tx,
             target: addr.clone(),
             rproto: msg.rproto,
+            proto: reply.proto,
             echo_id: AtomicU16::new(reply.echo_id),
             echo_seq: AtomicU16::new(reply.echo_seq),
             src: AtomicU32::new(u32::from(reply.src)),
@@ -365,7 +384,7 @@ impl Server {
                                 flow.echo_seq.load(Ordering::Relaxed), self.crypto.as_ref());
                             self.counters.add_send(n);
                             let dst = Ipv4Addr::from(flow.src.load(Ordering::Relaxed));
-                            let _ = self.tx.send((dst, bytes)).await;
+                            let _ = self.tx.send((dst, bytes, flow.proto)).await;
                         }
                         Ok(_) => {}
                         Err(_) => break,
@@ -385,6 +404,7 @@ impl Server {
             echo_id: flow.echo_id.load(Ordering::Relaxed),
             echo_seq: flow.echo_seq.load(Ordering::Relaxed),
             src: Ipv4Addr::from(flow.src.load(Ordering::Relaxed)),
+            proto: flow.proto,
         };
         self.remote_error(reply, id, flow.rproto);
     }
@@ -530,7 +550,7 @@ impl Server {
                     };
                     let bytes = encode_packet(msg, params.rproto as u8, reply.echo_id, reply.echo_seq, self.crypto.as_ref());
                     self.counters.add_send(bytes.len());
-                    let _ = self.tx.send((reply.src, bytes)).await;
+                    let _ = self.tx.send((reply.src, bytes, reply.proto)).await;
                 }
             }
 
@@ -581,7 +601,7 @@ impl Server {
             ..Default::default()
         };
         let bytes = encode_packet(msg, rproto as u8, reply.echo_id, reply.echo_seq, self.crypto.as_ref());
-        let _ = self.tx.try_send((reply.src, bytes));
+        let _ = self.tx.try_send((reply.src, bytes, reply.proto));
     }
 
     fn add_conn_error(&self, addr: &str) {
