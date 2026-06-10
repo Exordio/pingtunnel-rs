@@ -34,6 +34,8 @@ pub struct ServerConfig {
     pub maxconn: i32,
     pub connect_timeout: i32,
     pub frame_size: usize,
+    /// Номер IP-протокола транспорта (1 = ICMP по умолчанию; см. [`icmp::listen_icmp`]).
+    pub ip_proto: u8,
 }
 
 /// Параметры FrameMgr-соединения, объявленные клиентом в connect-пакете.
@@ -108,7 +110,7 @@ impl Server {
         crypto: Option<Crypto>,
         forward: Option<ForwardConfig>,
     ) -> Result<Arc<Server>> {
-        let (socket, datagram) = icmp::listen_icmp(&cfg.icmp_listen)?;
+        let (socket, datagram) = icmp::listen_icmp(&cfg.icmp_listen, cfg.ip_proto)?;
         if datagram {
             log::warn!("сервер в datagram-режиме: echo request не доставляется, нужен RAW (root)");
         }

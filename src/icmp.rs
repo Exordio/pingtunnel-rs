@@ -25,9 +25,24 @@ pub const ICMP_ECHO_REPLY: u8 = 0;
 // после сборки IP-фрагментов ядром). 64 КБ покрывает любой допустимый размер.
 const BUFSZ: usize = 65535;
 
-/// Открывает ICMP-сокет (RAW, при отказе — непривилегированный datagram),
-/// делает его неблокирующим и тюнит буферы. Возвращает сокет и флаг datagram.
-pub fn listen_icmp(addr: &str) -> Result<(Socket, bool)> {
+/// Номер IP-протокола для ICMP (IANA). Транспорт по умолчанию.
+pub const IP_PROTO_ICMP: u8 = 1;
+
+/// Открывает транспортный raw-сокет на IP-протоколе `proto`.
+///
+/// `proto == 1` (ICMP): как раньше — RAW, при отказе непривилегированный
+/// datagram-фоллбэк. Любой другой номер (напр. 253/254 из RFC 3692, под
+/// эксперименты) — это кастомный IP-протокол: только RAW (нужен CAP_NET_RAW),
+/// datagram-фоллбэка нет. Формат пакета (8-байтный псевдо-echo заголовок +
+/// protobuf) одинаков для всех протоколов — меняется лишь поле protocol в
+/// IP-заголовке, которое строит ядро.
+///
+/// ВНИМАНИЕ: кастомный протокол не переживает NAT (трансляция есть только для
+/// TCP/UDP/ICMP) и режется большинством файрволов. Имеет смысл только при
+/// прямой маршрутизации между клиентом и сервером без NAT по пути.
+///
+/// Делает сокет неблокирующим и тюнит буферы. Возвращает сокет и флаг datagram.
+pub fn listen_icmp(addr: &str, proto: u8) -> Result<(Socket, bool)> {
     let ip: Ipv4Addr = if addr.is_empty() {
         Ipv4Addr::UNSPECIFIED
     } else {
@@ -35,13 +50,19 @@ pub fn listen_icmp(addr: &str) -> Result<(Socket, bool)> {
     };
     let bind = SocketAddr::new(IpAddr::V4(ip), 0);
 
-    let (socket, datagram) = match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)) {
-        Ok(s) => (s, false),
-        Err(_) => {
-            let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))?;
-            log::warn!("RAW ICMP недоступен (нет CAP_NET_RAW), datagram-режим (клиентский)");
-            (s, true)
+    let (socket, datagram) = if proto == IP_PROTO_ICMP {
+        match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)) {
+            Ok(s) => (s, false),
+            Err(_) => {
+                let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))?;
+                log::warn!("RAW ICMP недоступен (нет CAP_NET_RAW), datagram-режим (клиентский)");
+                (s, true)
+            }
         }
+    } else {
+        let s = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(proto as i32)))?;
+        log::info!("транспорт: кастомный IP-протокол {proto} (RAW, экспериментальный)");
+        (s, false)
     };
     socket.bind(&bind.into())?;
     socket.set_nonblocking(true)?;

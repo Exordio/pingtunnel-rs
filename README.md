@@ -65,6 +65,7 @@ realities.)**
   - [Client: UDP forwarding](#client-udp-forwarding)
 - [Encryption](#encryption)
 - [Forwarding via a proxy](#forwarding-via-a-proxy)
+- [Experimental: custom IP protocol](#experimental-custom-ip-protocol)
 - [All command-line options](#all-command-line-options)
 - [Implementation architecture](#implementation-architecture)
 - [Tests](#tests)
@@ -210,6 +211,50 @@ sudo ./pingtunnel --type server --key 123456 --forward http://localhost:8080
 
 UDP forwarding via a proxy is supported only for `socks5` (UDP ASSOCIATE).
 
+## Experimental: custom IP protocol
+
+> ⚠️ **Experimental mode. Not a robust solution - see the limitations below.**
+
+By default the transport runs over ICMP (IP protocol 1). The `--ip_proto N` flag
+allows the same wire format to be used over a different IP protocol number -
+for example `253` or `254`, reserved by IANA for experimentation (RFC 3692).
+The packet format is unchanged (the same 8-byte pseudo-echo header and protobuf);
+only the `protocol` field of the IP header changes, and it is built by the kernel.
+
+Purpose: on some networks ICMP throughput is limited at the traffic-class level
+(DPI or a shaper targeting ICMP). Using a different IP protocol allows this
+ICMP-specific limiting to be avoided. A throughput of about 150-160 Mbit/s was
+measured with `--jumbo 1400` on a link where ICMP throughput was significantly
+limited.
+
+Limitations:
+- The protocol number must match on the client and the server.
+- A RAW socket is required on both ends (root or `CAP_NET_RAW`); the unprivileged
+  datagram mode is not available (unlike ICMP).
+- The mode is incompatible with NAT: translation is performed only for TCP, UDP
+  and ICMP, so a custom protocol has no return path through a stateful NAT.
+  Operation is possible only with direct routing, or through equipment that
+  forwards unknown protocols unchanged.
+- The protocol is easily blocked: unlike ICMP there is no accompanying legitimate
+  traffic, so it can be dropped entirely once detected.
+- There is no masquerading as ICMP echo.
+
+```bash
+# server
+sudo ./pingtunnel --type server --key 123456 --ip_proto 253
+
+# client
+./pingtunnel --type client -l :1080 -s SERVER --sock5 1 --key 123456 --ip_proto 253
+```
+
+Verifying that the protocol traverses the path (run on the server during transfer):
+
+```bash
+tcpdump -ni any 'ip proto 253'
+```
+
+To return to standard ICMP, omit the flag (or set it to `1`).
+
 ## All command-line options
 
 | Option          | Purpose                                                            | Default                  |
@@ -236,6 +281,7 @@ UDP forwarding via a proxy is supported only for `socks5` (UDP ASSOCIATE).
 | `--maxconn`     | maximum connections (0 — unlimited)                              | `0`                      |
 | `--conntt`      | server-to-target connect timeout, ms                             | `1000`                   |
 | `--forward`     | forwarding via a proxy (`socks5://…` / `http://…`)                | (off)                    |
+| `--ip_proto`    | transport IP protocol number (1 = ICMP; other = **experimental**, e.g. 253) | `1`            |
 | `--loglevel`    | log level (`debug`/`info`/`warn`/`error`)                        | `info`                   |
 | `--noprint`     | do not print output (`1`)                                        | `0`                      |
 | `--s5filter`    | SOCKS5 GeoIP filter — **not supported** (see differences)         | (off)                    |

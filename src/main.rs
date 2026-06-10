@@ -81,6 +81,14 @@ struct Args {
     conntt: i32,
     #[arg(long = "forward", default_value = "")]
     forward: String,
+    /// Номер IP-протокола транспорта. 1 = ICMP (по умолчанию). Любой другой
+    /// (напр. 253/254 - зарезервированы RFC 3692 под эксперименты) гонит трафик
+    /// поверх кастомного IP-протокола вместо ICMP. Нужен RAW-сокет (root/CAP_NET_RAW)
+    /// на обоих концах, datagram-фоллбэка нет. ВНИМАНИЕ: не переживает NAT и
+    /// режется большинством файрволов - работает лишь при прямой маршрутизации
+    /// без NAT по пути. Значение должно совпадать на клиенте и сервере.
+    #[arg(long = "ip_proto", default_value_t = 1)]
+    ip_proto: u8,
 }
 
 fn normalize_args() -> Vec<String> {
@@ -181,6 +189,7 @@ async fn run_server(args: Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
         maxconn: args.maxconn,
         connect_timeout: args.conntt,
         frame_size: frame_size(args.jumbo),
+        ip_proto: args.ip_proto,
     };
     let srv = server::Server::new(cfg, crypto, forward)?;
     srv.run().await
@@ -227,6 +236,7 @@ async fn run_client(args: Args, crypto: Option<Crypto>) -> anyhow::Result<()> {
         s5user: args.s5user.clone(),
         s5pass: args.s5pass.clone(),
         udp_reliable,
+        ip_proto: args.ip_proto,
     };
     let cli = client::Client::new(cfg, crypto)?;
     cli.run().await

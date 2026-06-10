@@ -48,6 +48,8 @@ pub struct ClientConfig {
     pub s5pass: String,
     /// Надёжный UDP-проброс: датаграммы идут через FrameMgr (см. [`udprel`]).
     pub udp_reliable: bool,
+    /// Номер IP-протокола транспорта (1 = ICMP по умолчанию; см. [`icmp::listen_icmp`]).
+    pub ip_proto: u8,
 }
 
 /// Сообщение в задачу соединения. Frames — пачка фреймов из одного recvmmsg-батча
@@ -89,7 +91,7 @@ pub struct Client {
 
 impl Client {
     pub fn new(cfg: ClientConfig, crypto: Option<Crypto>) -> Result<Arc<Client>> {
-        let (socket, datagram) = icmp::listen_icmp(&cfg.icmp_listen)?;
+        let (socket, datagram) = icmp::listen_icmp(&cfg.icmp_listen, cfg.ip_proto)?;
         let io = Arc::new(IcmpIo::new(socket)?);
         let tx = icmp::spawn_writer(io.clone(), 8192);
         let server_ip = resolve_ipv4(&cfg.server)?;
