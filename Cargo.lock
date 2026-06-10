@@ -864,30 +864,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
-name = "pingtunnel"
-version = "1.2.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "base64",
- "chacha20poly1305",
- "clap",
- "env_logger",
- "flate2",
- "libc",
- "log",
- "num_cpus",
- "pbkdf2",
- "prost",
- "prost-build",
- "rand",
- "ratatui",
- "sha2",
- "socket2",
- "tokio",
-]
-
-[[package]]
 name = "poly1305"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -993,6 +969,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
 dependencies = [
  "prost",
+]
+
+[[package]]
+name = "protofuse"
+version = "1.2.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "base64",
+ "chacha20poly1305",
+ "clap",
+ "env_logger",
+ "flate2",
+ "libc",
+ "log",
+ "num_cpus",
+ "pbkdf2",
+ "prost",
+ "prost-build",
+ "rand",
+ "ratatui",
+ "sha2",
+ "socket2",
+ "tokio",
 ]
 
 [[package]]

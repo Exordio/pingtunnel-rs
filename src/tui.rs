@@ -107,7 +107,7 @@ impl App {
         let total = self.stats.snapshot();
         let mut l1 = vec![
             Span::styled(
-                "pingtunnel",
+                "protofuse",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
@@ -138,7 +138,7 @@ impl App {
         let p = Paragraph::new(vec![Line::from(l1), l2]).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" pingtunnel monitor "),
+                .title(" protofuse monitor "),
         );
         f.render_widget(p, area);
     }

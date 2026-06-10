@@ -1,4 +1,4 @@
-# Стенд для профилирования клиента pingtunnel локально.
+# Стенд для профилирования клиента protofuse локально.
 # Сервер крутится на удалённом NL-хосте; клиент — здесь, в контейнере.
 # host-сеть, чтобы ICMP к серверу шёл без NAT; NET_RAW для RAW-ICMP, SYS_PTRACE для gdb/strace.
 services:
@@ -13,5 +13,5 @@ services:
     security_opt:
       - seccomp:unconfined
     volumes:
-      - ./pingtunnel:/work/pingtunnel:ro
+      - ./protofuse:/work/protofuse:ro
     command: sleep infinity

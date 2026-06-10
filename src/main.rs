@@ -1,5 +1,6 @@
-//! pingtunnel — туннелирование TCP/SOCKS5 поверх ICMP (async, tokio).
-//! Rust-порт https://github.com/esrrhs/pingtunnel.
+//! protofuse — туннелирование TCP/UDP/SOCKS5 поверх ICMP и произвольных
+//! IP-протоколов, с обфускацией трафика (async, tokio). Идейный прародитель -
+//! https://github.com/esrrhs/pingtunnel.
 
 mod client;
 mod crypto;
@@ -23,8 +24,8 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "pingtunnel",
-    about = "Туннелирование TCP/SOCKS5 трафика поверх ICMP (async, порт esrrhs/pingtunnel)",
+    name = "protofuse",
+    about = "Туннелирование TCP/UDP/SOCKS5 поверх ICMP и произвольных IP-протоколов с обфускацией (async)",
     long_about = None
 )]
 struct Args {
@@ -100,9 +101,31 @@ struct Args {
     /// диапазону (сервер отвечает тем же протоколом). Перекрывает `--ip_proto`.
     /// Диапазон должен совпадать на клиенте и сервере; нужен root/CAP_NET_RAW на
     /// обоих концах. ВНИМАНИЕ: кастомные протоколы не переживают NAT и заметны для
-    /// DPI. Пусто = выключено.
+    /// сетевых классификаторов. Пусто = выключено.
     #[arg(long = "ip_proto_range", default_value = "")]
     ip_proto_range: String,
+    /// Dynamic Packet Padding: к каждому пакету дописывается 0..=N случайных байт
+    /// (внутри шифрования), рандомизируя итоговый размер пакета по длинам.
+    /// Получатель паддинг игнорирует, согласование сторон не нужно.
+    /// 0 = выключено. Разумные значения - 64..256.
+    #[arg(long = "pad", default_value_t = 0)]
+    pad: u16,
+    /// Header Obfuscation: внутренний заголовок (id сессии, флаги) шифруется
+    /// целиком вместе с данными, а с провода снимается псевдо-echo обёртка - на
+    /// проводе остаётся лишь 12-байтный nonce и шифртекст, т.е. сплошной шум.
+    /// Требует включённого шифрования (--encrypt) и кастомного IP-протокола
+    /// (--ip_proto/--ip_proto_range): ICMP без echo-заголовка невалиден. Должно
+    /// совпадать на клиенте и сервере.
+    #[arg(long = "obfs", default_value_t = false)]
+    obfs: bool,
+    /// Базовый интервал фонового keep-alive (ping для удержания NAT/сессии), сек.
+    #[arg(long = "keepalive", default_value_t = 1)]
+    keepalive: u64,
+    /// Джиттер keep-alive: случайный разброс +/- N секунд вокруг базового
+    /// интервала (--keepalive), чтобы фоновые пакеты не шли строго периодичным
+    /// «пульсом». 0 = строго по интервалу. Только клиент.
+    #[arg(long = "keepalive_jitter", default_value_t = 0)]
+    keepalive_jitter: u64,
     /// Интерактивный TUI: графики скорости TX/RX и список активных соединений
     /// (тип, цель, IP-протокол транспорта, объём трафика). Туннель при этом
     /// работает в обычном режиме; логирование в stdout отключается, чтобы не
@@ -147,6 +170,23 @@ fn build_ip_protos(single: u8, range: &str) -> anyhow::Result<Vec<u8>> {
         anyhow::bail!("--ip_proto_range: допустимо 1..=254 и LO<=HI");
     }
     Ok((lo..=hi).map(|p| p as u8).collect())
+}
+
+/// Проверяет применимость `--obfs`: нужно шифрование (иначе заголовок не скрыть)
+/// и кастомный IP-протокол (ICMP без echo-обёртки невалиден, маскировка теряется).
+fn validate_obfs(obfs: bool, has_crypto: bool, ip_protos: &[u8]) -> anyhow::Result<()> {
+    if !obfs {
+        return Ok(());
+    }
+    if !has_crypto {
+        anyhow::bail!("--obfs требует включённого шифрования (--encrypt + --encrypt-key)");
+    }
+    if ip_protos == [icmp::IP_PROTO_ICMP] {
+        anyhow::bail!(
+            "--obfs неприменим к ICMP: нужен кастомный IP-протокол (--ip_proto N или --ip_proto_range)"
+        );
+    }
+    Ok(())
 }
 
 fn normalize_args() -> Vec<String> {
@@ -299,13 +339,17 @@ async fn run_server(args: Args, crypto: Option<Crypto>, stats: Arc<Stats>) -> an
     if forward.is_some() {
         log::info!("Forward proxy configured: {}", args.forward);
     }
+    let ip_protos = build_ip_protos(args.ip_proto, &args.ip_proto_range)?;
+    validate_obfs(args.obfs, crypto.is_some(), &ip_protos)?;
     let cfg = server::ServerConfig {
         icmp_listen: args.icmp_listen.clone(),
         key: args.key,
         maxconn: args.maxconn,
         connect_timeout: args.conntt,
         frame_size: frame_size(args.jumbo),
-        ip_protos: build_ip_protos(args.ip_proto, &args.ip_proto_range)?,
+        ip_protos,
+        pad_max: args.pad,
+        obfs: args.obfs,
     };
     let srv = server::Server::new(cfg, crypto, forward, stats)?;
     srv.run().await
@@ -334,6 +378,8 @@ async fn run_client(args: Args, crypto: Option<Crypto>, stats: Arc<Stats>) -> an
     if args.tcp_mw * 10 > proto::FRAME_MAX_ID {
         anyhow::bail!("tcp win too big, max = {}", proto::FRAME_MAX_ID / 10);
     }
+    let ip_protos = build_ip_protos(args.ip_proto, &args.ip_proto_range)?;
+    validate_obfs(args.obfs, crypto.is_some(), &ip_protos)?;
 
     let cfg = client::ClientConfig {
         listen: args.listen.clone(),
@@ -352,7 +398,11 @@ async fn run_client(args: Args, crypto: Option<Crypto>, stats: Arc<Stats>) -> an
         s5user: args.s5user.clone(),
         s5pass: args.s5pass.clone(),
         udp_reliable,
-        ip_protos: build_ip_protos(args.ip_proto, &args.ip_proto_range)?,
+        ip_protos,
+        pad_max: args.pad,
+        obfs: args.obfs,
+        keepalive_secs: args.keepalive,
+        keepalive_jitter: args.keepalive_jitter,
     };
     let cli = client::Client::new(cfg, crypto, stats)?;
     cli.run().await

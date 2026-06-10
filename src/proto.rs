@@ -1,8 +1,10 @@
 //! Сгенерированные prost-ом типы protobuf (MyMsg, Frame, FrameData).
-//! Wire-формат совпадает с оригинальным Go-проектом, поэтому Rust- и
-//! Go-версии совместимы между собой на уровне протокола.
+//! Базовый wire-формат унаследован от проекта-прародителя esrrhs/pingtunnel
+//! (protobuf MyMsg/Frame/FrameData), поэтому на уровне совместимых полей обмен с
+//! ним возможен; расширения protofuse (поле `pad`, кастомные IP-протоколы,
+//! обфускация заголовка) для старых пиров прозрачны или требуют той же версии.
 
-include!(concat!(env!("OUT_DIR"), "/pingtunnel.rs"));
+include!(concat!(env!("OUT_DIR"), "/protofuse.rs"));
 
 /// Магическое число протокола (MyMsg.MAGIC = 0xdead).
 pub const MAGIC: i32 = 0xdead;

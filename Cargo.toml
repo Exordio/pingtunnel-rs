@@ -1,13 +1,13 @@
 [package]
-name = "pingtunnel"
+name = "protofuse"
 version = "1.2.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Туннелирование TCP/UDP/SOCKS5 трафика поверх ICMP."
+description = "Туннелирование TCP/UDP/SOCKS5 трафика поверх ICMP и произвольных IP-протоколов с обфускацией."
 license = "MIT"
 
 [[bin]]
-name = "pingtunnel"
+name = "protofuse"
 path = "src/main.rs"
 
 [dependencies]

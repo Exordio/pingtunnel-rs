@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Нагрузочный тест: много параллельных соединений через SOCKS5-туннель.
-# Требует CAP_NET_RAW на бинаре (sudo setcap cap_net_raw+ep ./target/release/pingtunnel)
+# Требует CAP_NET_RAW на бинаре (sudo setcap cap_net_raw+ep ./target/release/protofuse)
 # или запуска под root.
 #
-# Поднимает HTTP-сервер с крупным файлом, сервер+клиент pingtunnel (socks5),
+# Поднимает HTTP-сервер с крупным файлом, сервер+клиент protofuse (socks5),
 # затем запускает N параллельных загрузок через прокси и следит за CPU/успехом.
 set -uo pipefail
 
-BIN="${BIN:-./target/release/pingtunnel}"
+BIN="${BIN:-./target/release/protofuse}"
 KEY="${KEY:-123456}"
 HTTP_PORT=18080
 SOCKS_PORT=11080

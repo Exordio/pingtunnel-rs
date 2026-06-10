@@ -19,6 +19,7 @@ use crate::crypto::Crypto;
 use crate::proto::{MyMsg, MAGIC};
 use anyhow::Result;
 use prost::Message;
+use rand::Rng;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::io;
@@ -64,7 +65,8 @@ pub struct Transport {
 /// Открывает транспорт под список IP-протоколов `protos`.
 ///
 /// `[1]` (ICMP) - inet raw, при отказе непривилегированный datagram-фоллбэк.
-/// Один кастомный номер (напр. 253/254 из RFC 3692) - inet raw (нужен CAP_NET_RAW).
+/// Один кастомный номер (напр. 253/254 из RFC 3692) - inet raw (нужен CAP_NET_RAW);
+/// штатный режим при ограничениях, см. README.
 /// Несколько номеров - экспериментальная ротация: приём через AF_PACKET с
 /// BPF-фильтром `[lo..hi]`, отправка - ленивые inet-raw сокеты.
 ///
@@ -109,7 +111,7 @@ pub fn listen_transport(addr: &str, protos: &[u8]) -> Result<Transport> {
         }
     } else {
         let s = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(proto as i32)))?;
-        log::info!("транспорт: кастомный IP-протокол {proto} (RAW, экспериментальный)");
+        log::info!("транспорт: кастомный IP-протокол {proto} (RAW)");
         (s, false)
     };
     socket.bind(&bind.into())?;
@@ -270,49 +272,100 @@ fn build_echo(icmp_type: u8, id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Кодирует MyMsg в готовый пакет (encode + шифрование + echo-обёртка).
-pub fn encode_packet(
-    mut my: MyMsg,
-    sproto: u8,
-    icmp_id: u16,
-    seq: u16,
-    crypto: Option<&Crypto>,
-) -> Vec<u8> {
+/// Параметры преобразования пакета на проводе: шифрование (AEAD), случайный
+/// паддинг (рандомизация размера, Dynamic Packet Padding) и обфускация заголовка
+/// (Header Obfuscation). Едина для кодирования и разбора; держится клиентом и
+/// сервером и прокидывается в [`encode_packet`]/[`parse_packet`].
+pub struct Wire {
+    crypto: Option<Crypto>,
+    /// Максимум случайных байт паддинга на пакет (0 = выключено).
+    pad_max: u16,
+    /// Обфускация заголовка: убрать псевдо-echo обёртку - на проводе остаётся лишь
+    /// nonce+шифртекст (сплошной шум). Допустима только при включённом шифровании
+    /// и кастомном IP-протоколе (валидируется в `main`).
+    obfs: bool,
+}
+
+impl Wire {
+    pub fn new(crypto: Option<Crypto>, pad_max: u16, obfs: bool) -> Wire {
+        Wire { crypto, pad_max, obfs }
+    }
+
+    /// Включена ли обфускация заголовка (нужно вызывающим: при obfs на проводе нет
+    /// echo-заголовка, поэтому echo_id для демультиплексирования недоступен).
+    pub fn obfs(&self) -> bool {
+        self.obfs
+    }
+}
+
+/// Кодирует MyMsg в готовый пакет: паддинг -> protobuf -> шифрование -> обёртка.
+/// Обёртка - псевдо-echo заголовок (8 байт), либо при `obfs` её нет и на проводе
+/// остаётся только `nonce||ciphertext`.
+pub fn encode_packet(mut my: MyMsg, sproto: u8, icmp_id: u16, seq: u16, wire: &Wire) -> Vec<u8> {
     my.magic = MAGIC;
+    // Dynamic Packet Padding: дописываем 0..=pad_max случайных байт в поле `pad`.
+    // Поле уходит внутрь шифрования, рандомизируя итоговый размер пакета; получатель
+    // его игнорирует. На пустом pad_max поле не сериализуется (wire-совместимо).
+    if wire.pad_max > 0 {
+        let n = (rand::random::<u32>() % (wire.pad_max as u32 + 1)) as usize;
+        if n > 0 {
+            let mut pad = vec![0u8; n];
+            rand::rng().fill_bytes(&mut pad);
+            my.pad = pad;
+        }
+    }
     let mut payload = Vec::with_capacity(my.encoded_len());
     my.encode(&mut payload).expect("encode MyMsg");
-    if let Some(c) = crypto {
+    if let Some(c) = &wire.crypto {
         payload = c.encrypt(&payload).unwrap_or(payload);
     }
-    build_echo(sproto, icmp_id, seq, &payload)
+    if wire.obfs {
+        // Header Obfuscation: без echo-обёртки, на проводе сплошной шум.
+        payload
+    } else {
+        build_echo(sproto, icmp_id, seq, &payload)
+    }
 }
 
 /// Разбирает входящий пакет (raw/packet: с IP-заголовком; datagram: без него).
-/// Возвращает (MyMsg, echo_id, echo_seq) либо None для чужих/битых.
-pub fn parse_packet(
-    raw: &[u8],
-    datagram: bool,
-    crypto: Option<&Crypto>,
-) -> Option<(MyMsg, u16, u16)> {
+/// Возвращает (MyMsg, echo_id, echo_seq) либо None для чужих/битых. При `obfs`
+/// echo-заголовка нет, echo_id/seq возвращаются нулями.
+pub fn parse_packet(raw: &[u8], datagram: bool, wire: &Wire) -> Option<(MyMsg, u16, u16)> {
     if raw.is_empty() {
         return None;
     }
-    let icmp = if datagram {
+    // Тело IP-пакета (для raw/packet снимаем IP-заголовок; datagram уже без него).
+    let body = if datagram {
         raw
     } else {
         let ihl = ((raw[0] & 0x0f) as usize) * 4;
-        if raw.len() < ihl + 8 {
+        if raw.len() < ihl {
             return None;
         }
         &raw[ihl..]
     };
-    if icmp.len() < 8 {
+
+    // Header Obfuscation: тело - сразу nonce||ciphertext, без echo-заголовка.
+    if wire.obfs {
+        let mut payload = body.to_vec();
+        if let Some(c) = &wire.crypto {
+            payload = c.decrypt(&payload).ok()?;
+        }
+        let my = MyMsg::decode(&payload[..]).ok()?;
+        if my.magic != MAGIC {
+            return None;
+        }
+        return Some((my, 0, 0));
+    }
+
+    // Обычный путь: псевдо-echo заголовок (8 байт) + payload.
+    if body.len() < 8 {
         return None;
     }
-    let echo_id = u16::from_be_bytes([icmp[4], icmp[5]]);
-    let echo_seq = u16::from_be_bytes([icmp[6], icmp[7]]);
-    let mut payload = icmp[8..].to_vec();
-    if let Some(c) = crypto {
+    let echo_id = u16::from_be_bytes([body[4], body[5]]);
+    let echo_seq = u16::from_be_bytes([body[6], body[7]]);
+    let mut payload = body[8..].to_vec();
+    if let Some(c) = &wire.crypto {
         payload = c.decrypt(&payload).ok()?;
     }
     let my = MyMsg::decode(&payload[..]).ok()?;
@@ -582,14 +635,56 @@ mod tests {
             key: 123456,
             ..Default::default()
         };
-        let pkt = encode_packet(my, ICMP_ECHO_REQUEST, 0xBEEF, 0x00AA, None);
+        let wire = Wire::new(None, 0, false);
+        let pkt = encode_packet(my, ICMP_ECHO_REQUEST, 0xBEEF, 0x00AA, &wire);
         // datagram=true: pkt - это уже сообщение без IP-заголовка
-        let (got, id, seq) = parse_packet(&pkt, true, None).unwrap();
+        let (got, id, seq) = parse_packet(&pkt, true, &wire).unwrap();
         assert_eq!(got.id, "conn-1");
         assert_eq!(got.rproto, -1);
         assert_eq!(got.key, 123456);
         assert_eq!(got.data, vec![1, 2, 3, 4, 5]);
         assert_eq!(id, 0xBEEF);
         assert_eq!(seq, 0x00AA);
+    }
+
+    fn sample_msg() -> MyMsg {
+        MyMsg {
+            id: "conn-xyz".into(),
+            r#type: 0,
+            data: vec![9; 20],
+            rproto: -1,
+            key: 42,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn padding_randomizes_size_and_strips() {
+        // Паддинг меняет размер пакета, но полезная нагрузка восстанавливается.
+        let wire = Wire::new(None, 256, false);
+        let mut sizes = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let pkt = encode_packet(sample_msg(), ICMP_ECHO_REQUEST, 1, 1, &wire);
+            sizes.insert(pkt.len());
+            let (got, _, _) = parse_packet(&pkt, true, &wire).unwrap();
+            assert_eq!(got.data, vec![9; 20]); // полезная нагрузка цела, pad игнорируется
+        }
+        // За 32 пакета при разбросе 0..256 размеры почти наверняка не совпадут все.
+        assert!(sizes.len() > 1, "padding не рандомизирует размер");
+    }
+
+    #[test]
+    fn obfs_roundtrip_no_echo_header() {
+        // С обфускацией на проводе нет echo-заголовка; шифрование обязательно.
+        let crypto = Crypto::new(crate::crypto::EncryptionMode::ChaCha20, "pass").unwrap();
+        let wire = Wire::new(crypto, 0, true);
+        let pkt = encode_packet(sample_msg(), ICMP_ECHO_REQUEST, 0xBEEF, 0x00AA, &wire);
+        // datagram=true: pkt - тело IP без заголовка, т.е. nonce||ciphertext.
+        let (got, id, seq) = parse_packet(&pkt, true, &wire).unwrap();
+        assert_eq!(got.id, "conn-xyz");
+        assert_eq!(got.data, vec![9; 20]);
+        // echo_id/seq в obfs недоступны - нули.
+        assert_eq!(id, 0);
+        assert_eq!(seq, 0);
     }
 }

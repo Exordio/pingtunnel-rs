@@ -1,6 +1,9 @@
-//! Шифрование полезной нагрузки ICMP: AES-128-GCM, AES-256-GCM,
-//! ChaCha20-Poly1305. Совместимо с Go-версией: к шифртексту впереди
-//! приписывается случайный nonce, ключ выводится из base64 или через PBKDF2.
+//! Шифрование полезной нагрузки транспорта: AES-128-GCM, AES-256-GCM,
+//! ChaCha20-Poly1305. К шифртексту впереди приписывается случайный 12-байтный
+//! nonce, ключ выводится из base64 или через PBKDF2 (соль `protofuse-salt`).
+//! ВНИМАНИЕ: соль для PBKDF2 отличается от прародителя (esrrhs/pingtunnel),
+//! поэтому ключи из парольной фразы несовместимы со старыми версиями - оба конца
+//! должны быть на protofuse. Ключи в base64 от смены соли не зависят.
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
@@ -115,7 +118,7 @@ fn derive_key(key_input: &str, key_size: usize) -> Result<Vec<u8>> {
             return Ok(decoded);
         }
     }
-    let salt = b"pingtunnel-salt";
+    let salt = b"protofuse-salt";
     let iterations = 10_000u32;
     let mut out = vec![0u8; key_size];
     pbkdf2::pbkdf2_hmac::<sha2::Sha256>(key_input.as_bytes(), salt, iterations, &mut out);

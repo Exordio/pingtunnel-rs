@@ -2,12 +2,12 @@
 # Сквозной (end-to-end) тест туннеля. Требует прав на RAW-сокеты для сервера
 # (запускайте через sudo, либо выдайте бинарю CAP_NET_RAW — см. README).
 #
-# Поднимает локальный HTTP-сервер, сервер и клиент pingtunnel, затем тянет
+# Поднимает локальный HTTP-сервер, сервер и клиент protofuse, затем тянет
 # страницу через TCP-туннель и сравнивает результат. Логи компонентов пишутся
 # в /tmp/pt_server.log и /tmp/pt_client.log.
 set -uo pipefail
 
-BIN="${BIN:-./target/release/pingtunnel}"
+BIN="${BIN:-./target/release/protofuse}"
 KEY="${KEY:-123456}"
 HTTP_PORT=18080
 LOCAL_PORT=14455
@@ -23,13 +23,13 @@ python3 -m http.server "$HTTP_PORT" >/dev/null 2>&1 &
 HTTP_PID=$!
 sleep 1
 
-echo ">> запускаем pingtunnel server (лог: /tmp/pt_server.log)"
+echo ">> запускаем protofuse server (лог: /tmp/pt_server.log)"
 RUST_LOG="$LOGLEVEL" "$BIN" --type server --key "$KEY" --loglevel "$LOGLEVEL" \
   >/tmp/pt_server.log 2>&1 &
 SRV_PID=$!
 sleep 1
 
-echo ">> запускаем pingtunnel client TCP forward :$LOCAL_PORT -> 127.0.0.1:$HTTP_PORT (лог: /tmp/pt_client.log)"
+echo ">> запускаем protofuse client TCP forward :$LOCAL_PORT -> 127.0.0.1:$HTTP_PORT (лог: /tmp/pt_client.log)"
 RUST_LOG="$LOGLEVEL" "$BIN" --type client -l "127.0.0.1:$LOCAL_PORT" -s 127.0.0.1 \
   -t "127.0.0.1:$HTTP_PORT" --tcp 1 --key "$KEY" --loglevel "$LOGLEVEL" \
   >/tmp/pt_client.log 2>&1 &

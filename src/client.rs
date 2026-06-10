@@ -5,7 +5,7 @@
 
 use crate::crypto::Crypto;
 use crate::framemgr::{marshal_frame, FrameMgr};
-use crate::icmp::{self, encode_packet, IcmpIo, OutPkt, RecvBatch, RecvMode, ICMP_ECHO_REQUEST};
+use crate::icmp::{self, encode_packet, IcmpIo, OutPkt, RecvBatch, RecvMode, Wire, ICMP_ECHO_REQUEST};
 use crate::proto::*;
 use crate::socks5;
 use crate::stats::{ConnInfo, ConnKind, Stats};
@@ -53,6 +53,15 @@ pub struct ClientConfig {
     /// ротация: на каждое соединение выбирается случайный протокол из списка
     /// (см. [`icmp::listen_transport`]).
     pub ip_protos: Vec<u8>,
+    /// Максимум случайных байт паддинга на пакет (Dynamic Packet Padding; 0 = off).
+    pub pad_max: u16,
+    /// Обфускация заголовка (Header Obfuscation): снять echo-обёртку, на проводе
+    /// только nonce+шифртекст. Требует шифрования и кастомного IP-протокола.
+    pub obfs: bool,
+    /// Базовый интервал фонового keep-alive (ping), сек.
+    pub keepalive_secs: u64,
+    /// Джиттер keep-alive: разброс +/- сек вокруг базового интервала (0 = строго).
+    pub keepalive_jitter: u64,
 }
 
 /// Сообщение в задачу соединения. Frames — пачка фреймов из одного recvmmsg-батча
@@ -80,7 +89,7 @@ pub struct Client {
     cfg: ClientConfig,
     rx: Arc<IcmpIo>,
     tx: mpsc::Sender<OutPkt>,
-    crypto: Option<Crypto>,
+    wire: Wire,
     datagram: bool,
     id: u16,
     seq: AtomicU32,
@@ -102,11 +111,12 @@ impl Client {
         let rx = t.rx;
         let server_ip = resolve_ipv4(&cfg.server)?;
         let id = (rand::random::<u16>() & 0x7fff).max(1);
+        let wire = Wire::new(crypto, cfg.pad_max, cfg.obfs);
         Ok(Arc::new(Client {
             cfg,
             rx,
             tx,
-            crypto,
+            wire,
             datagram,
             id,
             seq: AtomicU32::new(0),
@@ -139,6 +149,7 @@ impl Client {
     pub async fn run(self: Arc<Self>) -> Result<()> {
         tokio::spawn(self.clone().read_loop());
         tokio::spawn(self.clone().maintenance());
+        tokio::spawn(self.clone().keepalive());
 
         log::info!(
             "Client listen {} server {} ({}) icmp {} (async, frame={}B, protos={}){}",
@@ -196,14 +207,16 @@ impl Client {
                         for i in 0..n {
                             let (raw, _src) = recv_batch.get(i);
                             let (msg, echo_id, _seq) =
-                                match icmp::parse_packet(raw, self.datagram, self.crypto.as_ref()) {
+                                match icmp::parse_packet(raw, self.datagram, &self.wire) {
                                     Some(v) => v,
                                     None => continue,
                                 };
                             if msg.rproto >= 0 || msg.key != self.cfg.key {
                                 continue;
                             }
-                            if !self.datagram && echo_id != self.id {
+                            // В obfs нет echo-заголовка: echo_id отсутствует
+                            // (parse возвращает 0), фильтр по id пропускаем.
+                            if !self.datagram && !self.wire.obfs() && echo_id != self.id {
                                 continue;
                             }
                             match msg.r#type {
@@ -258,7 +271,7 @@ impl Client {
             key: self.cfg.key,
             ..Default::default()
         };
-        let bytes = encode_packet(msg, SEND_PROTO, self.id, self.next_seq(), self.crypto.as_ref());
+        let bytes = encode_packet(msg, SEND_PROTO, self.id, self.next_seq(), &self.wire);
         let _ = self.tx.try_send((self.server_ip(), bytes, self.pick_proto()));
     }
 
@@ -270,7 +283,7 @@ impl Client {
             key: self.cfg.key,
             ..Default::default()
         };
-        let bytes = encode_packet(msg, SEND_PROTO, self.id, self.next_seq(), self.crypto.as_ref());
+        let bytes = encode_packet(msg, SEND_PROTO, self.id, self.next_seq(), &self.wire);
         let _ = self.tx.try_send((self.server_ip(), bytes, self.pick_proto()));
     }
 
@@ -294,7 +307,7 @@ impl Client {
             timeout: if with_params { self.cfg.timeout } else { 0 },
             ..Default::default()
         };
-        encode_packet(msg, SEND_PROTO, self.id, self.next_seq(), self.crypto.as_ref())
+        encode_packet(msg, SEND_PROTO, self.id, self.next_seq(), &self.wire)
     }
 
     // ── Простой UDP-проброс (без гарантий доставки) ───────────────────────
@@ -311,7 +324,7 @@ impl Client {
             timeout: self.cfg.timeout,
             ..Default::default()
         };
-        let bytes = encode_packet(msg, SEND_PROTO, self.id, self.next_seq(), self.crypto.as_ref());
+        let bytes = encode_packet(msg, SEND_PROTO, self.id, self.next_seq(), &self.wire);
         self.counters.add_send(data.len());
         let _ = self.tx.try_send((self.server_ip(), bytes, proto));
     }
@@ -776,11 +789,30 @@ impl Client {
 
     // ── Обслуживание ─────────────────────────────────────────────────────
 
+    /// Фоновый keep-alive: шлёт транспортный ping, чтобы удержать NAT/сессию,
+    /// когда туннель простаивает. Интервал - `--keepalive` сек, плюс случайный
+    /// джиттер +/- `--keepalive_jitter` сек (через `sleep`, а не `interval`),
+    /// чтобы фоновые пакеты не образовывали строго периодичный «пульс».
+    async fn keepalive(self: Arc<Self>) {
+        let base = self.cfg.keepalive_secs.max(1);
+        let jitter = self.cfg.keepalive_jitter;
+        loop {
+            let secs = if jitter == 0 {
+                base as f64
+            } else {
+                let lo = base.saturating_sub(jitter).max(1) as f64;
+                let hi = (base + jitter) as f64;
+                lo + rand::random::<f64>() * (hi - lo)
+            };
+            tokio::time::sleep(Duration::from_secs_f64(secs)).await;
+            self.ping();
+        }
+    }
+
     async fn maintenance(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tick.tick().await;
-            self.ping();
             // Закрываем неактивные простые UDP-соединения (надёжные закрываются
             // сами в своих задачах по простою).
             let now = now_ns();

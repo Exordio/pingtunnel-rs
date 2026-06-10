@@ -7,7 +7,7 @@
 use crate::crypto::Crypto;
 use crate::forward::{self, ForwardConfig};
 use crate::framemgr::{marshal_frame, FrameMgr};
-use crate::icmp::{self, encode_packet, IcmpIo, OutPkt, RecvBatch, RecvMode};
+use crate::icmp::{self, encode_packet, IcmpIo, OutPkt, RecvBatch, RecvMode, Wire};
 use crate::proto::*;
 use crate::stats::{ConnInfo, ConnKind, Stats};
 use crate::udprel;
@@ -38,6 +38,11 @@ pub struct ServerConfig {
     /// IP-протоколы транспорта. `[1]` = ICMP. Несколько = ротация
     /// (приём через AF_PACKET, см. [`icmp::listen_transport`]).
     pub ip_protos: Vec<u8>,
+    /// Максимум случайных байт паддинга на пакет (Dynamic Packet Padding; 0 = off).
+    pub pad_max: u16,
+    /// Обфускация заголовка (Header Obfuscation): снять echo-обёртку. Должна
+    /// совпадать с клиентом; требует шифрования и кастомного IP-протокола.
+    pub obfs: bool,
 }
 
 /// Параметры FrameMgr-соединения, объявленные клиентом в connect-пакете.
@@ -99,7 +104,7 @@ pub struct Server {
     rx: Arc<IcmpIo>,
     recv_mode: RecvMode,
     tx: mpsc::Sender<OutPkt>,
-    crypto: Option<Crypto>,
+    wire: Wire,
     datagram: bool,
     forward: Option<ForwardConfig>,
     // Соединения с FrameMgr-надёжностью (TCP и надёжный UDP): conn-id → канал
@@ -126,12 +131,13 @@ impl Server {
         let recv_mode = t.recv_mode;
         let rx = t.rx.clone();
         let tx = icmp::spawn_writer(&t, 8192);
+        let wire = Wire::new(crypto, cfg.pad_max, cfg.obfs);
         Ok(Arc::new(Server {
             cfg,
             rx,
             recv_mode,
             tx,
-            crypto,
+            wire,
             datagram,
             forward,
             conns: Mutex::new(HashMap::new()),
@@ -179,7 +185,7 @@ impl Server {
                                 (addr_src, self.rx.proto)
                             };
                             let (msg, echo_id, echo_seq) =
-                                match icmp::parse_packet(raw, self.datagram, self.crypto.as_ref()) {
+                                match icmp::parse_packet(raw, self.datagram, &self.wire) {
                                     Some(v) => v,
                                     None => continue,
                                 };
@@ -201,7 +207,7 @@ impl Server {
                                         msg.rproto as u8,
                                         echo_id,
                                         echo_seq,
-                                        self.crypto.as_ref(),
+                                        &self.wire,
                                     );
                                     let _ = self.tx.try_send((src, bytes, proto));
                                 }
@@ -396,7 +402,7 @@ impl Server {
                             };
                             let bytes = encode_packet(msg, flow.rproto as u8,
                                 flow.echo_id.load(Ordering::Relaxed),
-                                flow.echo_seq.load(Ordering::Relaxed), self.crypto.as_ref());
+                                flow.echo_seq.load(Ordering::Relaxed), &self.wire);
                             self.counters.add_send(n);
                             flow.info.add_send(n);
                             let dst = Ipv4Addr::from(flow.src.load(Ordering::Relaxed));
@@ -570,7 +576,7 @@ impl Server {
                         key: self.cfg.key,
                         ..Default::default()
                     };
-                    let bytes = encode_packet(msg, params.rproto as u8, reply.echo_id, reply.echo_seq, self.crypto.as_ref());
+                    let bytes = encode_packet(msg, params.rproto as u8, reply.echo_id, reply.echo_seq, &self.wire);
                     self.counters.add_send(bytes.len());
                     info.add_send(bytes.len());
                     let _ = self.tx.send((reply.src, bytes, reply.proto)).await;
@@ -624,7 +630,7 @@ impl Server {
             key: self.cfg.key,
             ..Default::default()
         };
-        let bytes = encode_packet(msg, rproto as u8, reply.echo_id, reply.echo_seq, self.crypto.as_ref());
+        let bytes = encode_packet(msg, rproto as u8, reply.echo_id, reply.echo_seq, &self.wire);
         let _ = self.tx.try_send((reply.src, bytes, reply.proto));
     }
 
