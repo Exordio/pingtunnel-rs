@@ -328,14 +328,36 @@ pub fn encode_packet(mut my: MyMsg, sproto: u8, icmp_id: u16, seq: u16, wire: &W
     }
     let mut payload = Vec::with_capacity(my.encoded_len());
     my.encode(&mut payload).expect("encode MyMsg");
-    if let Some(c) = &wire.crypto {
-        payload = c.encrypt(&payload).unwrap_or(payload);
-    }
+
+    // Header Obfuscation: без echo-обёртки, на проводе только nonce||ct||tag (шум).
     if wire.obfs {
-        // Header Obfuscation: без echo-обёртки, на проводе сплошной шум.
-        payload
-    } else {
-        build_echo(sproto, icmp_id, seq, &payload)
+        return match &wire.crypto {
+            Some(c) => c.encrypt(&payload).unwrap_or(payload),
+            None => payload,
+        };
+    }
+
+    // Псевдо-echo заголовок (8 байт) + тело. При шифровании пишем заголовок и
+    // шифруем тело прямо в тот же буфер (encrypt_into) - без отдельного Vec под
+    // шифртекст и лишней копии payload, которую делал build_echo.
+    match &wire.crypto {
+        Some(c) => {
+            let mut out = Vec::with_capacity(8 + 12 + payload.len() + 16);
+            out.push(sproto);
+            out.extend_from_slice(&[0, 0, 0]);
+            out.extend_from_slice(&icmp_id.to_be_bytes());
+            out.extend_from_slice(&seq.to_be_bytes());
+            if c.encrypt_into(&payload, &mut out).is_ok() {
+                let cs = checksum(&out);
+                out[2..4].copy_from_slice(&cs.to_be_bytes());
+                out
+            } else {
+                // Шифрование не удалось (практически невозможно) - откат к прежнему
+                // поведению: echo с открытым payload (пир его всё равно отбросит).
+                build_echo(sproto, icmp_id, seq, &payload)
+            }
+        }
+        None => build_echo(sproto, icmp_id, seq, &payload),
     }
 }
 
@@ -707,6 +729,20 @@ mod tests {
         }
         // За 32 пакета при разбросе 0..256 размеры почти наверняка не совпадут все.
         assert!(sizes.len() > 1, "padding не рандомизирует размер");
+    }
+
+    #[test]
+    fn encrypted_echo_roundtrip() {
+        // Шифрование + псевдо-echo заголовок (путь encrypt_into): id/seq в
+        // заголовке целы, тело расшифровывается и декодируется.
+        let crypto = Crypto::new(crate::crypto::EncryptionMode::Aes256, "pass").unwrap();
+        let wire = Wire::new(crypto, 0, false);
+        let pkt = encode_packet(sample_msg(), ICMP_ECHO_REQUEST, 0xBEEF, 0x00AA, &wire);
+        let (got, id, seq) = parse_packet(&pkt, true, &wire).unwrap();
+        assert_eq!(got.id, "conn-xyz");
+        assert_eq!(got.data, vec![9; 20]);
+        assert_eq!(id, 0xBEEF);
+        assert_eq!(seq, 0x00AA);
     }
 
     #[test]

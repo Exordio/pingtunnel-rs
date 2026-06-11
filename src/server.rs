@@ -80,8 +80,11 @@ enum Incoming {
 }
 
 /// Накопленные за один recvmmsg-батч фреймы одного соединения вместе с последним
-/// адресом ответа (обновляется на каждом пакете батча).
+/// адресом ответа (обновляется на каждом пакете батча) и каналом в задачу
+/// соединения. Канал кэшируется при первом появлении id в батче, чтобы не брать
+/// мьютекс `conns` на каждый пакет.
 struct BatchedFrames {
+    tx: mpsc::Sender<Incoming>,
     frames: Vec<Vec<u8>>,
     reply: ReplyTo,
 }
@@ -241,32 +244,43 @@ impl Server {
                                         continue;
                                     }
                                     // FrameMgr-соединение (TCP или надёжный UDP).
-                                    let exists = self.conns.lock().unwrap().contains_key(&msg.id);
-                                    if exists {
-                                        self.counters.add_recv(msg.data.len());
-                                        let batch = groups.entry(msg.id).or_insert_with(|| {
-                                            BatchedFrames {
-                                                frames: Vec::new(),
-                                                reply,
+                                    // Канал соединения ищем один раз на (id, батч):
+                                    // если id уже в группе - просто докидываем фрейм
+                                    // (без мьютекса), иначе лочим conns единожды.
+                                    match groups.get_mut(&msg.id) {
+                                        Some(batch) => {
+                                            self.counters.add_recv(msg.data.len());
+                                            batch.reply = reply;
+                                            batch.frames.push(msg.data);
+                                        }
+                                        None => {
+                                            let conn_tx =
+                                                self.conns.lock().unwrap().get(&msg.id).cloned();
+                                            match conn_tx {
+                                                Some(tx) => {
+                                                    self.counters.add_recv(msg.data.len());
+                                                    groups.insert(
+                                                        msg.id,
+                                                        BatchedFrames {
+                                                            tx,
+                                                            frames: vec![msg.data],
+                                                            reply,
+                                                        },
+                                                    );
+                                                }
+                                                // новое соединение — создаём сразу (редкий путь)
+                                                None => self.create_conn(msg, reply),
                                             }
-                                        });
-                                        batch.frames.push(msg.data);
-                                        batch.reply = reply;
-                                    } else {
-                                        // новое соединение — создаём сразу (редкий путь)
-                                        self.create_conn(msg, reply);
+                                        }
                                     }
                                 }
                             }
                         }
-                        for (id, batch) in groups.drain() {
-                            let conn_tx = self.conns.lock().unwrap().get(&id).cloned();
-                            if let Some(conn_tx) = conn_tx {
-                                let _ = conn_tx.try_send(Incoming::Data {
-                                    frames: batch.frames,
-                                    reply: batch.reply,
-                                });
-                            }
+                        for (_id, batch) in groups.drain() {
+                            let _ = batch.tx.try_send(Incoming::Data {
+                                frames: batch.frames,
+                                reply: batch.reply,
+                            });
                         }
                     }
                     Ok(Err(e)) => {

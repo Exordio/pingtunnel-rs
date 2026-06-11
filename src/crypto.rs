@@ -75,23 +75,30 @@ impl Crypto {
     }
 
     pub fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(12 + data.len() + 16);
+        self.encrypt_into(data, &mut out)?;
+        Ok(out)
+    }
+
+    /// Дописывает `nonce||ciphertext||tag` в конец `out` (out может уже содержать
+    /// префикс, напр. echo-заголовок) - шифрование in-place, без промежуточного
+    /// Vec под ciphertext и лишнего копирования. На проводе байты те же, что и при
+    /// combined-encrypt.
+    pub fn encrypt_into(&self, data: &[u8], out: &mut Vec<u8>) -> Result<()> {
         let mut nonce_bytes = [0u8; 12];
         rand::rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
-        // Шифруем in-place в один итоговый буфер nonce||ciphertext||tag, без
-        // промежуточного Vec под ciphertext и лишнего копирования (на проводе
-        // байты те же, что и при combined-encrypt).
-        let mut out = Vec::with_capacity(12 + data.len() + 16);
+        let body_start = out.len() + 12;
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(data);
         let tag = match &self.cipher {
-            Cipher::Aes128(c) => c.encrypt_in_place_detached(nonce, b"", &mut out[12..]),
-            Cipher::Aes256(c) => c.encrypt_in_place_detached(nonce, b"", &mut out[12..]),
-            Cipher::Cha(c) => c.encrypt_in_place_detached(nonce, b"", &mut out[12..]),
+            Cipher::Aes128(c) => c.encrypt_in_place_detached(nonce, b"", &mut out[body_start..]),
+            Cipher::Aes256(c) => c.encrypt_in_place_detached(nonce, b"", &mut out[body_start..]),
+            Cipher::Cha(c) => c.encrypt_in_place_detached(nonce, b"", &mut out[body_start..]),
         }
         .map_err(|e| anyhow!("encrypt failed: {e}"))?;
         out.extend_from_slice(tag.as_slice());
-        Ok(out)
+        Ok(())
     }
 
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
