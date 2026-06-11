@@ -1,6 +1,6 @@
 [package]
 name = "protofuse"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2024"
 rust-version = "1.85"
 description = "Туннелирование TCP/UDP/SOCKS5 трафика поверх ICMP и произвольных IP-протоколов с обфускацией."

@@ -62,6 +62,8 @@ pub struct ClientConfig {
     pub keepalive_secs: u64,
     /// Джиттер keep-alive: разброс +/- сек вокруг базового интервала (0 = строго).
     pub keepalive_jitter: u64,
+    /// Интервал возврата свободной памяти ОС (malloc_trim), сек. 0 = выключено.
+    pub mem_trim_secs: u64,
 }
 
 /// Сообщение в задачу соединения. Frames — пачка фреймов из одного recvmmsg-батча
@@ -841,12 +843,14 @@ impl Client {
                     *cur = ip;
                 }
             }
-            // Раз в минуту возвращаем ОС память, освобождённую закрытыми
-            // соединениями (glibc сам её не отдаёт - см. [`trim_memory`]).
-            since_trim += 1;
-            if since_trim >= 60 {
-                since_trim = 0;
-                trim_memory();
+            // Опционально (--mem_trim N): возвращаем ОС память, освобождённую
+            // закрытыми соединениями (glibc сам её не отдаёт - см. [`trim_memory`]).
+            if self.cfg.mem_trim_secs > 0 {
+                since_trim += 1;
+                if since_trim >= self.cfg.mem_trim_secs as u32 {
+                    since_trim = 0;
+                    trim_memory();
+                }
             }
         }
     }

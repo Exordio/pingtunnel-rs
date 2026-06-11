@@ -43,6 +43,8 @@ pub struct ServerConfig {
     /// Обфускация заголовка (Header Obfuscation): снять echo-обёртку. Должна
     /// совпадать с клиентом; требует шифрования и кастомного IP-протокола.
     pub obfs: bool,
+    /// Интервал возврата свободной памяти ОС (malloc_trim), сек. 0 = выключено.
+    pub mem_trim_secs: u64,
 }
 
 /// Параметры FrameMgr-соединения, объявленные клиентом в connect-пакете.
@@ -659,12 +661,14 @@ impl Server {
             log::info!(
                 "send {send_pkts}Packet/s {send_kb}KB/s recv {recv_pkts}Packet/s {recv_kb}KB/s {conns}Connections"
             );
-            // Раз в минуту возвращаем ОС память, освобождённую закрытыми
-            // соединениями (glibc сам её не отдаёт - см. [`trim_memory`]).
-            since_trim += 1;
-            if since_trim >= 60 {
-                since_trim = 0;
-                trim_memory();
+            // Опционально (--mem_trim N): возвращаем ОС память, освобождённую
+            // закрытыми соединениями (glibc сам её не отдаёт - см. [`trim_memory`]).
+            if self.cfg.mem_trim_secs > 0 {
+                since_trim += 1;
+                if since_trim >= self.cfg.mem_trim_secs as u32 {
+                    since_trim = 0;
+                    trim_memory();
+                }
             }
         }
     }

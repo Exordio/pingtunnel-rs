@@ -126,6 +126,13 @@ struct Args {
     /// «пульсом». 0 = строго по интервалу. Только клиент.
     #[arg(long = "keepalive_jitter", default_value_t = 0)]
     keepalive_jitter: u64,
+    /// Периодический возврат свободной памяти ОС через malloc_trim каждые N сек:
+    /// glibc держит освобождённую закрытыми соединениями память в аренах и не
+    /// отдаёт её ядру сам, поэтому RSS застывает на пиковом значении. Возврат
+    /// затрагивает только уже свободные страницы и не влияет на соединения.
+    /// 0 = выключено (по умолчанию). Эффективно лишь на glibc-сборках.
+    #[arg(long = "mem_trim", default_value_t = 0)]
+    mem_trim: u64,
     /// Интерактивный TUI: графики скорости TX/RX и список активных соединений
     /// (тип, цель, IP-протокол транспорта, объём трафика). Туннель при этом
     /// работает в обычном режиме; логирование в stdout отключается, чтобы не
@@ -350,6 +357,7 @@ async fn run_server(args: Args, crypto: Option<Crypto>, stats: Arc<Stats>) -> an
         ip_protos,
         pad_max: args.pad,
         obfs: args.obfs,
+        mem_trim_secs: args.mem_trim,
     };
     let srv = server::Server::new(cfg, crypto, forward, stats)?;
     srv.run().await
@@ -403,6 +411,7 @@ async fn run_client(args: Args, crypto: Option<Crypto>, stats: Arc<Stats>) -> an
         obfs: args.obfs,
         keepalive_secs: args.keepalive,
         keepalive_jitter: args.keepalive_jitter,
+        mem_trim_secs: args.mem_trim,
     };
     let cli = client::Client::new(cfg, crypto, stats)?;
     cli.run().await
