@@ -5,7 +5,7 @@
 //! поэтому ключи из парольной фразы несовместимы со старыми версиями - оба конца
 //! должны быть на protofuse. Ключи в base64 от смены соли не зависят.
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, AeadInPlace, KeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
 use anyhow::{anyhow, bail, Result};
 use base64::Engine;
@@ -78,16 +78,19 @@ impl Crypto {
         let mut nonce_bytes = [0u8; 12];
         rand::rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = match &self.cipher {
-            Cipher::Aes128(c) => c.encrypt(nonce, data),
-            Cipher::Aes256(c) => c.encrypt(nonce, data),
-            Cipher::Cha(c) => c.encrypt(nonce, data),
+        // Шифруем in-place в один итоговый буфер nonce||ciphertext||tag, без
+        // промежуточного Vec под ciphertext и лишнего копирования (на проводе
+        // байты те же, что и при combined-encrypt).
+        let mut out = Vec::with_capacity(12 + data.len() + 16);
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(data);
+        let tag = match &self.cipher {
+            Cipher::Aes128(c) => c.encrypt_in_place_detached(nonce, b"", &mut out[12..]),
+            Cipher::Aes256(c) => c.encrypt_in_place_detached(nonce, b"", &mut out[12..]),
+            Cipher::Cha(c) => c.encrypt_in_place_detached(nonce, b"", &mut out[12..]),
         }
         .map_err(|e| anyhow!("encrypt failed: {e}"))?;
-
-        let mut out = Vec::with_capacity(12 + ciphertext.len());
-        out.extend_from_slice(&nonce_bytes);
-        out.extend_from_slice(&ciphertext);
+        out.extend_from_slice(tag.as_slice());
         Ok(out)
     }
 

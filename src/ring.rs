@@ -212,7 +212,7 @@ impl ROBuffer {
     pub fn front_acked(&self) -> bool {
         self.begin < self.flag.len()
             && self.flag[self.begin]
-            && self.buffer[self.begin].as_ref().map_or(false, |f| f.acked)
+            && self.buffer[self.begin].as_ref().is_some_and(|f| f.acked)
     }
 
     pub fn front_id(&self) -> Option<i64> {

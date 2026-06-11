@@ -14,9 +14,16 @@ pub fn now_ns() -> i64 {
 
 /// Уникальный идентификатор соединения (32 hex-символа).
 pub fn unique_id() -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut b = [0u8; 16];
     rand::rng().fill_bytes(&mut b);
-    b.iter().map(|x| format!("{x:02x}")).collect()
+    // Один буфер на 32 символа вместо format! на каждый байт (16 аллокаций).
+    let mut s = String::with_capacity(32);
+    for x in b {
+        s.push(HEX[(x >> 4) as usize] as char);
+        s.push(HEX[(x & 0x0f) as usize] as char);
+    }
+    s
 }
 
 /// Возвращает ОС свободную память кучи. Надёжные соединения держат крупные

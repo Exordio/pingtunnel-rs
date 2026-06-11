@@ -765,10 +765,8 @@ impl Client {
                 }
             }
 
-            if !fm.is_connected() {
-                if start.elapsed() > Duration::from_secs(5) {
-                    break;
-                }
+            if !fm.is_connected() && start.elapsed() > Duration::from_secs(5) {
+                break;
             }
             if fm.is_remote_closed() {
                 break;

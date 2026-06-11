@@ -21,6 +21,7 @@ use anyhow::Result;
 use prost::Message;
 use rand::Rng;
 use socket2::{Domain, Protocol, Socket, Type};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -243,14 +244,25 @@ impl IcmpIo {
 // ── Контрольная сумма и сборка echo ──────────────────────────────────────
 
 fn checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
+    // Internet checksum (ones' complement сумма 16-битных big-endian слов).
+    // Считаем по 8 байт за итерацию в u64-аккумуляторе - свёртка переносов
+    // отложена до конца, цикл в ~4 раза короче побайтового (важно для jumbo).
+    let mut sum: u64 = 0;
+    let mut chunks = data.chunks_exact(8);
+    for c in chunks.by_ref() {
+        sum += u16::from_be_bytes([c[0], c[1]]) as u64;
+        sum += u16::from_be_bytes([c[2], c[3]]) as u64;
+        sum += u16::from_be_bytes([c[4], c[5]]) as u64;
+        sum += u16::from_be_bytes([c[6], c[7]]) as u64;
+    }
+    let rem = chunks.remainder();
     let mut i = 0;
-    while i + 1 < data.len() {
-        sum += ((data[i] as u32) << 8) | (data[i + 1] as u32);
+    while i + 1 < rem.len() {
+        sum += u16::from_be_bytes([rem[i], rem[i + 1]]) as u64;
         i += 2;
     }
-    if i < data.len() {
-        sum += (data[i] as u32) << 8;
+    if i < rem.len() {
+        sum += (rem[i] as u64) << 8;
     }
     while (sum >> 16) != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
@@ -347,11 +359,12 @@ pub fn parse_packet(raw: &[u8], datagram: bool, wire: &Wire) -> Option<(MyMsg, u
 
     // Header Obfuscation: тело - сразу nonce||ciphertext, без echo-заголовка.
     if wire.obfs {
-        let mut payload = body.to_vec();
-        if let Some(c) = &wire.crypto {
-            payload = c.decrypt(&payload).ok()?;
-        }
-        let my = MyMsg::decode(&payload[..]).ok()?;
+        // decrypt/decode принимают срез - расшифровываем/декодируем прямо из
+        // тела пакета, без промежуточной копии (.to_vec) на каждом пакете.
+        let my = match &wire.crypto {
+            Some(c) => MyMsg::decode(&c.decrypt(body).ok()?[..]).ok()?,
+            None => MyMsg::decode(body).ok()?,
+        };
         if my.magic != MAGIC {
             return None;
         }
@@ -364,11 +377,11 @@ pub fn parse_packet(raw: &[u8], datagram: bool, wire: &Wire) -> Option<(MyMsg, u
     }
     let echo_id = u16::from_be_bytes([body[4], body[5]]);
     let echo_seq = u16::from_be_bytes([body[6], body[7]]);
-    let mut payload = body[8..].to_vec();
-    if let Some(c) = &wire.crypto {
-        payload = c.decrypt(&payload).ok()?;
-    }
-    let my = MyMsg::decode(&payload[..]).ok()?;
+    let ct = &body[8..];
+    let my = match &wire.crypto {
+        Some(c) => MyMsg::decode(&c.decrypt(ct).ok()?[..]).ok()?,
+        None => MyMsg::decode(ct).ok()?,
+    };
     if my.magic != MAGIC {
         return None;
     }
@@ -376,6 +389,19 @@ pub fn parse_packet(raw: &[u8], datagram: bool, wire: &Wire) -> Option<(MyMsg, u
 }
 
 // ── Батч приёма (recvmmsg) ───────────────────────────────────────────────
+
+// Per-thread scratch под временные iovec/mmsghdr. recvmmsg/sendmmsg - самый
+// горячий путь; раньше оба массива аллоцировались заново на каждый syscall.
+// Буферы переиспользуются (clear сохраняет capacity), так что после прогрева
+// аллокаций в этом пути нет. Доступ синхронный и невложенный (recv в read-таске,
+// send в writer-таске, ни один не держится через .await), поэтому RefCell
+// безопасен и сами батчи остаются Send.
+thread_local! {
+    static RECV_SCRATCH: RefCell<(Vec<libc::iovec>, Vec<libc::mmsghdr>)> =
+        const { RefCell::new((Vec::new(), Vec::new())) };
+    static SEND_SCRATCH: RefCell<(Vec<libc::iovec>, Vec<libc::mmsghdr>)> =
+        const { RefCell::new((Vec::new(), Vec::new())) };
+}
 
 fn sockaddr_v4(ip: Ipv4Addr) -> libc::sockaddr_in {
     let mut sa: libc::sockaddr_in = unsafe { mem::zeroed() };
@@ -419,38 +445,43 @@ impl RecvBatch {
     /// Один вызов recvmmsg. Возвращает число принятых пакетов или Err(WouldBlock).
     pub fn recv(&mut self, sock: &Socket) -> io::Result<usize> {
         let n = self.cap;
-        let mut iovs: Vec<libc::iovec> = Vec::with_capacity(n);
-        for i in 0..n {
-            iovs.push(libc::iovec {
-                iov_base: self.bufs[i].as_mut_ptr() as *mut libc::c_void,
-                iov_len: self.bufsz,
-            });
-        }
-        let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(n);
-        for i in 0..n {
-            let mut mh: libc::mmsghdr = unsafe { mem::zeroed() };
-            mh.msg_hdr.msg_name = &mut self.addrs[i] as *mut _ as *mut libc::c_void;
-            mh.msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            mh.msg_hdr.msg_iov = &mut iovs[i] as *mut libc::iovec;
-            mh.msg_hdr.msg_iovlen = 1;
-            msgs.push(mh);
-        }
-        let r = unsafe {
-            libc::recvmmsg(
-                sock.as_raw_fd(),
-                msgs.as_mut_ptr(),
-                n as libc::c_uint,
-                libc::MSG_DONTWAIT,
-                ptr::null_mut(),
-            )
-        };
-        if r < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        for i in 0..r as usize {
-            self.lens[i] = msgs[i].msg_len as usize;
-        }
-        Ok(r as usize)
+        RECV_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            let (iovs, msgs) = &mut *scratch;
+            iovs.clear();
+            for i in 0..n {
+                iovs.push(libc::iovec {
+                    iov_base: self.bufs[i].as_mut_ptr() as *mut libc::c_void,
+                    iov_len: self.bufsz,
+                });
+            }
+            msgs.clear();
+            for (addr, iov) in self.addrs[..n].iter_mut().zip(iovs.iter_mut()) {
+                let mut mh: libc::mmsghdr = unsafe { mem::zeroed() };
+                mh.msg_hdr.msg_name = addr as *mut _ as *mut libc::c_void;
+                mh.msg_hdr.msg_namelen =
+                    mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                mh.msg_hdr.msg_iov = iov as *mut libc::iovec;
+                mh.msg_hdr.msg_iovlen = 1;
+                msgs.push(mh);
+            }
+            let r = unsafe {
+                libc::recvmmsg(
+                    sock.as_raw_fd(),
+                    msgs.as_mut_ptr(),
+                    n as libc::c_uint,
+                    libc::MSG_DONTWAIT,
+                    ptr::null_mut(),
+                )
+            };
+            if r < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            for (slot, mh) in self.lens[..r as usize].iter_mut().zip(msgs.iter()) {
+                *slot = mh.msg_len as usize;
+            }
+            Ok(r as usize)
+        })
     }
 
     /// Возвращает (байты пакета, src из адреса). В режиме AF_PACKET адрес - это
@@ -503,34 +534,39 @@ impl SendBatch {
         if n == 0 {
             return Ok(0);
         }
-        let mut iovs: Vec<libc::iovec> = Vec::with_capacity(n);
-        for i in 0..n {
-            iovs.push(libc::iovec {
-                iov_base: self.bufs[i].as_mut_ptr() as *mut libc::c_void,
-                iov_len: self.bufs[i].len(),
-            });
-        }
-        let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(n);
-        for i in 0..n {
-            let mut mh: libc::mmsghdr = unsafe { mem::zeroed() };
-            mh.msg_hdr.msg_name = &mut self.dsts[i] as *mut _ as *mut libc::c_void;
-            mh.msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-            mh.msg_hdr.msg_iov = &mut iovs[i] as *mut libc::iovec;
-            mh.msg_hdr.msg_iovlen = 1;
-            msgs.push(mh);
-        }
-        let r = unsafe {
-            libc::sendmmsg(
-                sock.as_raw_fd(),
-                msgs.as_mut_ptr(),
-                n as libc::c_uint,
-                libc::MSG_DONTWAIT,
-            )
-        };
-        if r < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let sent = r as usize;
+        let sent = SEND_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            let (iovs, msgs) = &mut *scratch;
+            iovs.clear();
+            for i in 0..n {
+                iovs.push(libc::iovec {
+                    iov_base: self.bufs[i].as_mut_ptr() as *mut libc::c_void,
+                    iov_len: self.bufs[i].len(),
+                });
+            }
+            msgs.clear();
+            for (dst, iov) in self.dsts[..n].iter_mut().zip(iovs.iter_mut()) {
+                let mut mh: libc::mmsghdr = unsafe { mem::zeroed() };
+                mh.msg_hdr.msg_name = dst as *mut _ as *mut libc::c_void;
+                mh.msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                mh.msg_hdr.msg_iov = iov as *mut libc::iovec;
+                mh.msg_hdr.msg_iovlen = 1;
+                msgs.push(mh);
+            }
+            let r = unsafe {
+                libc::sendmmsg(
+                    sock.as_raw_fd(),
+                    msgs.as_mut_ptr(),
+                    n as libc::c_uint,
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if r < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(r as usize)
+            }
+        })?;
         self.dsts.drain(0..sent);
         self.bufs.drain(0..sent);
         Ok(sent)
